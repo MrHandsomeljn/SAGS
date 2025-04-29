@@ -1,0 +1,9 @@
+data
+imgs
+my_pipeline
+segmentation.ipynb
+gaussiansplatting/submodules/*
+gaussiansplatting/dependencies/*
+**/__pycache__
+outputs
+**.pth

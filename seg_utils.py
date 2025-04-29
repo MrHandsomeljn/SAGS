@@ -26,7 +26,7 @@ def image_transform(image) -> torch.Tensor:
 def grounding_dino_prompt(image, text):
     
     image_tensor = image_transform(Image.fromarray(image))
-    model_root = 'dependencies/GroundingDINO'
+    model_root = 'gaussiansplatting/dependencies/GroundingDINO'
     
     model = load_model(os.path.join(model_root, "groundingdino/config/GroundingDINO_SwinT_OGC.py"), os.path.join(model_root, "weights/groundingdino_swint_ogc.pth"))
     
