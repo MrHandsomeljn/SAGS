@@ -5,6 +5,7 @@
 Use it to segment any gaussian easily, capable with multiview annotation ability.
 Text prompt would be release when I'm available.
 Undo and Redo might incur additional GPU Memory cost.
+Requires gradio>=5
 
 Gradio版本的SAGS，支持多视角标注，背面也可以加约束了。
 有空想整一个文本提示版本。

@@ -32,6 +32,21 @@ from segment_anything import (SamAutomaticMaskGenerator, SamPredictor,
 from gradio_litmodel3d import LitModel3D
 
 
+pipeline, background = None, None
+
+# 递归查找所有名为"model"的文件夹
+def find_model_folders(base_path, relative_to="."):
+    model_paths = []
+    if os.path.exists(base_path):
+        # 如果relative_to是None,则相对于当前目录
+        if relative_to is None: relative_to = "."
+        for root, dirs, files in os.walk(base_path):
+            if os.path.basename(root) == "model":
+                # 获取相对于relative_to的路径
+                rel_path = os.path.relpath(root, relative_to)
+                model_paths.append(rel_path)
+    return model_paths
+
 # region 加载Gaussian
 
 def get_combined_args(parser : ArgumentParser, model_path):
@@ -58,28 +73,7 @@ def get_combined_args(parser : ArgumentParser, model_path):
             merged_dict[k] = v
     return Namespace(**merged_dict)
 
-def load_gaussian_scene(model_path):
-    parser = ArgumentParser(description="Testing script parameters")
-    model = ModelParams(parser, sentinel=True)
-    pipeline = PipelineParams(parser) # 渲染用
-    parser.add_argument("--iteration", default=-1, type=int)
-    parser.add_argument("--skip_train", action="store_true")
-    parser.add_argument("--skip_test", action="store_true")
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--threshold", default=0.7, type=float, help='threshold of label voting')
-    parser.add_argument("--gd_interval", default=20, type=int, help='interval of performing gaussian decomposition')
-    args = get_combined_args(parser, model_path)
 
-    dataset = model.extract(args)
-    dataset.model_path = args.model_path
-    gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
-    cameras = scene.getTrainCameras()
-    dataset.white_background = True
-    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-    return scene, args, dataset, pipeline, background
 
 # endregion
 
@@ -99,7 +93,7 @@ def load_sam(
     return predictor
 
 # extract and use sam features
-def extract_sam_features(predictor, cameras, gaussians, pipeline, background):
+def extract_sam_features(predictor, cameras, gaussians):
     sam_features = {}
     render_images = {}
     print("Prepocessing: extracting SAM features...")
@@ -114,7 +108,7 @@ def extract_sam_features(predictor, cameras, gaussians, pipeline, background):
         sam_features[image_name] = predictor.features
     return sam_features
 
-def extract_sam_features_pt(scene_path, predictor, cameras, gaussians, pipeline, background):
+def extract_sam_features_pt(scene_path, predictor, cameras, gaussians):
     # 检查路径是否存在
     if scene_path and os.path.exists(scene_path):
         sam_path = os.path.join(scene_path,"sam_pt")
@@ -126,7 +120,7 @@ def extract_sam_features_pt(scene_path, predictor, cameras, gaussians, pipeline,
             print(f" Failed: {e}")
     
     print("Extract sam feature ...")
-    sam_features = extract_sam_features(predictor, cameras, gaussians, pipeline, background)
+    sam_features = extract_sam_features(predictor, cameras, gaussians)
     
     if scene_path:
         sam_path = os.path.join(scene_path,"sam_pt")
@@ -136,54 +130,7 @@ def extract_sam_features_pt(scene_path, predictor, cameras, gaussians, pipeline,
     
     return sam_features
 
-# text guided, masks[id,H,W,C=1]
-def text_prompt_seg(image, text):
-    input_boxes = grounding_dino_prompt(image, text)
 
-    boxes = torch.tensor(input_boxes)[0:1].cuda()
-    transformed_boxes = predictor.transform.apply_boxes_torch(boxes, image.shape[:2])
-    masks,  _, _ = predictor.predict_torch(
-        point_coords=None,
-        point_labels=None,
-        boxes=transformed_boxes,
-        multimask_output=True,
-    )
-    masks = masks[0].cpu().numpy()
-    return (masks[:, :, :, None]*255).astype(np.uint8) / 255 # id,H,W,1
-
-# point guided, masks[id,H,W,C=1], 2D点标注
-def self_prompt_seg(point_prompts, sam_feature):
-    input_point = point_prompts.detach().cpu().numpy()
-    # input_point = input_point[::-1]
-    input_label = np.ones(len(input_point))
-
-    predictor.features = sam_feature
-    masks, _, _ = predictor.predict(
-        point_coords=input_point,
-        point_labels=input_label,
-        multimask_output=True,
-    )
-    # return_mask = (masks[ :, :, 0]*255).astype(np.uint8)
-    # return_mask = (masks[id, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
-    return_mask = (masks[:, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
-
-    return return_mask / 255
-
-def self_prompt(point_prompts, sam_feature, id):
-    input_point = point_prompts.detach().cpu().numpy()
-    # input_point = input_point[::-1]
-    input_label = np.ones(len(input_point))
-
-    predictor.features = sam_feature
-    masks, _, _ = predictor.predict(
-        point_coords=input_point,
-        point_labels=input_label,
-        multimask_output=True,
-    )
-    # return_mask = (masks[ :, :, 0]*255).astype(np.uint8)
-    return_mask = (masks[id, :, :, None]*255).astype(np.uint8)
-
-    return return_mask / 255
 
 # endregion
 
@@ -294,44 +241,7 @@ def mask_inverse(xyz, viewpoint_camera, sam_mask):
 
     return point_mask, indices_mask
 
-def generate_multiview_masks(scene, images, pipeline, background, prompts_3D, mask_id = 0, progress:gr.Progress=None):
-    """
-    sam_mask        (cuda) : list[torch.int64(id,H,W)] , 每个视角下的渲染图的sam mask
-    multiview_masks (cuda) : list[torch.int64(N,1)]    , 每个视角下，每个Gaussians点的mask  
-    """
-    cameras = scene.getTrainCameras()
-    gaussians = scene.gaussians
-    multiview_masks = []
-    sam_masks = []
-    sam_mask_all_levels = []
-    if progress is None: use_tqdm = tqdm(enumerate(cameras), desc="generate multiview masks")
-    else: use_tqdm = progress.tqdm(enumerate(cameras), desc="generate multiview masks")
-    for i, view in use_tqdm:
-        # render_pkg = render(view, gaussians, pipeline, background)
-        # render_image = render_pkg["render"].permute(1, 2, 0).detach().cpu().numpy()
-        image_name = view.image_name # added
-        render_image = images[image_name] # added
-        render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
 
-        # sam prediction
-        # point_base
-        # project 3d prompts to 2d prompts
-        prompts_2d = project_to_2d(view, prompts_3D)
-        sam_mask_all_level = self_prompt_seg(prompts_2d, sam_features[image_name]) # [id,H,W,C=1]
-        sam_mask_all_levels.append(sam_mask_all_level)
-
-        sam_mask = sam_mask_all_level[mask_id]
-        if len(sam_mask.shape) != 2: sam_mask = torch.from_numpy(sam_mask).squeeze(-1).to("cuda")
-        else: sam_mask = torch.from_numpy(sam_mask).to("cuda")
-        sam_mask = sam_mask.long() # 2D mask image
-        sam_masks.append(sam_mask)
-        
-        # print(f"sam_mask {sam_mask.shape} {sam_mask.dtype}")
-        # mask assignment to gaussians
-        point_mask, indices_mask = mask_inverse(gaussians.get_xyz, view, sam_mask)
-        multiview_masks.append(point_mask.unsqueeze(-1))
-
-    return sam_mask_all_levels, sam_masks, multiview_masks
 
 # endregion
 
@@ -377,16 +287,20 @@ def save_gs(pc, indices_mask, save_path):
 
 
 class GradioAnnotationTool:
-    def __init__(self, args, dataset, images: Dict[str, np.ndarray], predictor, sam_features=None, scene=None, pipeline=None, background=None):
-        self.images = images
+    def __init__(self, model_path, predictor):
         self.predictor = predictor
-        self.args = args
-        self.dataset = dataset
+        if model_path is not None: self.load_gaussian_scene(model_path)
+        else:
+            self.scene         = None 
+            self.args          = None 
+            self.dataset       = None 
+            self.images        = {} 
+            self.sam_features  = {}
+            self.current_image =  None
 
-        # 设置一次，传入图像尺寸等，之后直接改feature
-        self.current_image = list(images.keys())[0]
-        self.predictor.set_image(images[self.current_image])
-        
+        self.saved_fg_path = None
+        self.saved_bg_path = None
+
         self.maskid = 0  # 将maskid移动到类实例变量
         self.seg2d_mark = {
             name: {
@@ -395,7 +309,7 @@ class GradioAnnotationTool:
                 'history': [],      # 历史记录 [(points, masks), ...]
                 'history_index': -1, # 历史记录索引，用于撤销/重做
                 'prompts_3D': []    # 存储3D点标注
-            } for name in images.keys()
+            } for name in self.images.keys()
         }
         self.multiview_mask = {
             "records": [],      # 每条记录结构如下（见下方）：
@@ -412,13 +326,77 @@ class GradioAnnotationTool:
         #     "sam_all": {img1_name: mask1, img2_name: mask2}  # sam_mask_all_levels（用于可视化）
         # }
 
-        self.sam_features = sam_features
-        self.scene = scene  # 保存场景信息，用于3D点生成
-        self.pipeline = pipeline
-        self.background = background
-        self.saved_fg_path = None
-        self.saved_bg_path = None
+    def load_gaussian_scene(self, model_path, progress:gr.Progress=None):
+        global pipeline
+        global background
         
+        if self.scene is not None: del self.scene
+        if self.seg2d_mark is not None: del self.seg2d_mark
+        if self.multiview_mask is not None: del self.multiview_mask
+
+        print("Loading Gaussian Scene")
+        if progress is not None: progress(0, desc="Get Args")
+
+        parser = ArgumentParser(description="Testing script parameters")
+        model = ModelParams(parser, sentinel=True)
+        pipeline = PipelineParams(parser) # 渲染用
+
+        parser.add_argument("--iteration", default=-1, type=int)
+        parser.add_argument("--skip_train", action="store_true")
+        parser.add_argument("--skip_test", action="store_true")
+        parser.add_argument("--quiet", action="store_true")
+        parser.add_argument("--threshold", default=0.7, type=float, help='threshold of label voting')
+        parser.add_argument("--gd_interval", default=20, type=int, help='interval of performing gaussian decomposition')
+        self.args = get_combined_args(parser, model_path)
+
+        self.dataset = model.extract(self.args)
+        self.dataset.model_path = self.args.model_path
+
+        if progress is not None: progress(0.1, desc="Load Gaussian Scenes")
+        gaussians = GaussianModel(self.dataset.sh_degree)
+        self.scene = Scene(self.dataset, gaussians, load_iteration=self.args.iteration, shuffle=False)
+        self.dataset.white_background = True
+        bg_color = [1,1,1] if self.dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        if progress is not None: progress(0.4, desc="Rendering Images")
+        self.images = {}
+        for view in self.scene.getTrainCameras():
+            render_pkg = render(view, self.scene.gaussians, pipeline, background)
+            render_image = render_pkg["render"].permute(1, 2, 0).detach().cpu().numpy()
+            render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
+            self.images[view.image_name] = render_image
+
+        if progress is not None: progress(0.7, desc="Get Sam Features")
+        # SAM_Features烂了
+        self.sam_features = extract_sam_features_pt(model_path, self.predictor, self.scene.getTrainCameras(), self.scene.gaussians)
+        self.current_image = list(self.images.keys())[0]
+        self.predictor.set_image(self.images[self.current_image])
+        self.seg2d_mark = {
+            name: {
+                'points': [],
+                'masks': None,
+                'history': [],
+                'history_index': -1,
+                'prompts_3D': []
+            } for name in self.images.keys()
+        }
+        self.multiview_mask = {
+            "records": [],
+            "current_index": -1
+        }
+        print("加载完成")
+        if progress is not None: progress(1, desc="Finished")
+
+    def load_scene_gaussians(self):
+        gaussians = GaussianModel(self.dataset.sh_degree)
+        gaussians.load_ply(
+            os.path.join(self.scene.model_path,
+            "point_cloud",
+            "iteration_" + str(self.scene.loaded_iter),
+            "point_cloud.ply"))
+        return gaussians
+
     def get_current_state(self):
         mark = self.seg2d_mark[self.current_image]
         return self.current_image, mark['points'], mark['masks']
@@ -435,7 +413,7 @@ class GradioAnnotationTool:
         x, y = evt.index
         
         # 添加新点
-        print(f"add state: {self.current_image}, {mark['history_index']}, {len(mark['history'])}, {len(mark['points'])}")
+        print(f"add state: {self.current_image}, {mark['history_index']}, {len(mark['history'])}, {len(mark['points'])}, ({x},{y})")
         mark['points'].append([x, y])
         mark["history_index"] += 1
         
@@ -567,11 +545,77 @@ class GradioAnnotationTool:
         return self._render_display()
     
 
-    def get_current_multiview_mask(self):
-        idx = self.multiview_mask["current_index"]
-        if 0 <= idx < len(self.multiview_mask["records"]):
-            return self.multiview_mask["records"][idx]
-        return None
+    def generate_multiview_masks(self, prompts_3D, text_prompt = None, progress:gr.Progress=None):
+        """
+        sam_mask        (cuda) : list[torch.int64(id,H,W)] , 每个视角下的渲染图的sam mask
+        multiview_masks (cuda) : list[torch.int64(N,1)]    , 每个视角下，每个Gaussians点的mask  
+        """
+        # text guided, masks[id,H,W,C=1]
+        def text_prompt_seg(image, text):
+            input_boxes = grounding_dino_prompt(image, text)
+
+            boxes = torch.tensor(input_boxes)[0:1].cuda()
+            transformed_boxes = predictor.transform.apply_boxes_torch(boxes, image.shape[:2])
+            masks,  _, _ = predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=transformed_boxes,
+                multimask_output=True,
+            )
+            masks = masks[0].cpu().numpy()
+            return (masks[:, :, :, None]*255).astype(np.uint8) / 255 # id,H,W,1
+
+        # point guided, masks[id,H,W,C=1], 2D点标注
+        def self_prompt_seg(point_prompts, sam_feature):
+            input_point = point_prompts.detach().cpu().numpy()
+            # input_point = input_point[::-1]
+            input_label = np.ones(len(input_point))
+
+            predictor.features = sam_feature
+            masks, _, _ = predictor.predict(
+                point_coords=input_point,
+                point_labels=input_label,
+                multimask_output=True,
+            )
+            # return_mask = (masks[ :, :, 0]*255).astype(np.uint8)
+            # return_mask = (masks[id, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
+            return_mask = (masks[:, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
+
+            return return_mask / 255
+        
+        
+        scene = self.scene
+        images = self.images
+        mask_id = self.maskid
+        cameras = scene.getTrainCameras()
+        gaussians = scene.gaussians
+        sam_masks = []
+        multiview_masks = []
+        sam_mask_all_levels = []
+        for i, view in tqdm(enumerate(cameras), desc="generate multiview masks"):
+            image_name = view.image_name # added
+            if text_prompt is not None:
+                render_image = images[image_name] # added
+                render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
+                sam_mask_all_level = text_prompt_seg(render_image, text_prompt)
+            else:
+                prompts_2d = project_to_2d(view, prompts_3D)
+                sam_mask_all_level = self_prompt_seg(prompts_2d, self.sam_features[image_name]) # [id,H,W,C=1]
+
+            sam_mask_all_levels.append(sam_mask_all_level)
+
+            sam_mask = sam_mask_all_level[mask_id]
+            if len(sam_mask.shape) != 2: sam_mask = torch.from_numpy(sam_mask).squeeze(-1).to("cuda")
+            else: sam_mask = torch.from_numpy(sam_mask).to("cuda")
+            sam_mask = sam_mask.long() # 2D mask image
+            sam_masks.append(sam_mask)
+            
+            # print(f"sam_mask {sam_mask.shape} {sam_mask.dtype}")
+            # mask assignment to gaussians
+            point_mask, indices_mask = mask_inverse(gaussians.get_xyz, view, sam_mask)
+            multiview_masks.append(point_mask.unsqueeze(-1))
+
+        return sam_mask_all_levels, sam_masks, multiview_masks
 
     def _get_mask(self, match_mask_id = False, progress:gr.Progress=None):
         """
@@ -619,7 +663,7 @@ class GradioAnnotationTool:
         # --- 若找到记录且包含当前 maskid，直接复用 ---
         if matched_index is not None and (not match_mask_id or self.maskid in self.multiview_mask["records"][matched_index]["mvmask"]):
             self.multiview_mask["current_index"] = matched_index
-            print(f"Reusing cached mask at index {matched_index} for maskid {self.maskid}")
+            print(f"Reusing cached mask at index {matched_index} for maskid {self.maskid}, {len(self.multiview_mask['records'][matched_index]['prompts'])}")
             # 显示 2D mask
             for img_name in self.images.keys():
                 mask = self.multiview_mask["records"][matched_index]["sam_all"].get(img_name)
@@ -627,8 +671,7 @@ class GradioAnnotationTool:
             return
 
         # 没有命中，生成新的
-        sam_alls, sam_masks, multiviews = generate_multiview_masks(
-            self.scene, self.images, None, None, prompts_3D_tensor, self.maskid, progress=progress)
+        sam_alls, sam_masks, multiviews = self.generate_multiview_masks(prompts_3D_tensor, progress=progress)
         print("multiview_masks generated\n")
 
        # 刷新所有展示图片
@@ -815,28 +858,26 @@ class GradioAnnotationTool:
         self._get_mask(match_mask_id=True, progress=progress) # 需要match maskid
         model_path = self.scene.model_path
         gaussians = self.scene.gaussians
-        pipeline = self.pipeline
-        background = self.background
         _, final_mask = self.ensemble(threshold)
         cameras = self.scene.getTrainCameras()
         if progress is not None: progress(0.1, desc="gaussian multiview decomp")
 
         self.saved_fg_path = os.path.join(model_path, f'objects/{object_name}/fg.ply')
+        os.makedirs(os.path.dirname(self.saved_fg_path), exist_ok=True)
         save_gs(gaussians, final_mask, self.saved_fg_path)
         if progress is not None: progress(0.3, desc="gaussian multiview decomp")
 
         # if gaussian decomposition as a post-process module
-        if progress is None: use_tqdm = tqdm(enumerate(cameras), desc="gaussian multiview decomp")
-        else:use_tqdm = progress.tqdm(enumerate(cameras), desc="gaussian multiview decomp")
-        for i, view in use_tqdm:
+        de_gaussian = self.load_scene_gaussians()
+        for i, view in tqdm(enumerate(cameras), desc="gaussian multiview decomp"):
             if self.args.gd_interval != -1 and i % self.args.gd_interval == 0:
                 input_mask = self.multiview_mask["records"][self.multiview_mask["current_index"]]["mvmask"][self.maskid]["sam_masks"][i]
-                gaussians = gaussian_decomp(gaussians, view, input_mask, final_mask.to('cuda'))
+                de_gaussian = gaussian_decomp(de_gaussian, view, input_mask, final_mask.to('cuda'))
         if progress is not None: progress(0.5, desc="render segged gaussian")
 
         # save after gaussian decomposition
-        # self.saved_bg_path = os.path.join(model_path, f'objects/{object_name}/bg.ply')
-        save_gs(gaussians, final_mask, self.saved_fg_path)
+        self.saved_bg_path = os.path.join(model_path, f'objects/{object_name}/bg.ply')
+        save_gs(de_gaussian, final_mask, self.saved_fg_path+"2.ply")
         if progress is not None: progress(0.7, desc="render segged gaussian")
         
         # render object images
@@ -848,9 +889,7 @@ class GradioAnnotationTool:
         os.makedirs(obj_save_path, exist_ok=True)
 
         if not os.path.exists(obj_save_path): os.mkdir(obj_save_path)
-        if progress is None: use_tqdm = tqdm(range(len(cameras)), desc="render segged gaussian")
-        else: use_tqdm = progress.tqdm(range(len(cameras)), desc="render segged gaussian")
-        for idx in use_tqdm:
+        for idx in tqdm(range(len(cameras)), desc="render segged gaussian"):
             image_name = cameras[idx].image_name
             view = cameras[idx]
 
@@ -865,8 +904,8 @@ class GradioAnnotationTool:
 
 
 
-def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_features=None, pipeline=None, background=None):
-    tool = GradioAnnotationTool(args, dataset, images, predictor, sam_features, scene, pipeline=pipeline, background=background)
+def create_gradio_interface(default_model_paths, predictor):
+    tool = GradioAnnotationTool(model_path=None, predictor=predictor)
     
     with gr.Blocks() as demo:
         with gr.Row():
@@ -897,13 +936,24 @@ def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_fe
                         interactive=True  # 确保交互性
                     )
         with gr.Row() as prompt_col:
-            object_name_input = gr.Textbox(placeholder="Your Object Name", show_label=False, interactive=True, submit_btn="Seg!")
+            with gr.Column(scale=1):
+                model_path_input = gr.Dropdown(
+                    choices=default_model_paths,
+                    allow_custom_value=True,
+                    value="",
+                    show_label=False,
+                    interactive=True,
+                )
+            with gr.Column(scale=0.5):
+                model_path_btn = gr.Button("Open Model")
+            with gr.Column(scale=1):
+                object_name_input = gr.Textbox(placeholder="Your Object Name", show_label=False, interactive=True, submit_btn="Seg!")
 
         with gr.Row():
             with gr.Column(scale=2):
                 gallery = gr.Gallery(
                     label="Gallery",
-                    value=list(images.values()),
+                    value=list(tool.images.values()),
                     columns=4,
                     object_fit="contain",
                     height="auto"
@@ -917,8 +967,8 @@ def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_fe
         
         # 处理mask选择
         def on_mask_select(choice):
-            mask_id = 0
-            if choice == "M": mask_id = 1
+            if choice == "S": mask_id = 0
+            elif choice == "M": mask_id = 1
             elif choice == "L": mask_id = 2
             
             # 调用set_mask_id方法并返回最右侧图像
@@ -949,7 +999,25 @@ def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_fe
             mask_id = tool.maskid  # 使用类实例变量
             if mask_id >= len(available_masks): mask_id = len(available_masks)-1
             return orig, mask, selected, gr.update(choices=available_masks, value=available_masks[mask_id] if available_masks else None)
-        
+
+        def load_with_progress(model_path, progress=gr.Progress(track_tqdm=True)):
+            torch.cuda.empty_cache()
+            tool.load_gaussian_scene(model_path, progress=progress)
+            orig = tool._render_original()
+            mask = tool._render_mask()
+            selected = tool._render_selected_mask()
+            available_masks = get_available_mask_choices(tool)
+            return \
+                gr.update(value = list(tool.images.values())),\
+                orig, mask, selected, \
+                gr.update(choices=available_masks, value=available_masks[0] if available_masks else None)
+
+        model_path_btn.click(
+            fn=load_with_progress,
+            inputs=model_path_input,
+            outputs=[gallery, original_display, mask_display, selected_mask_display, mask_selector],
+        )
+
         # 使用select事件，更新输出包含mask选择器
         original_display.select(
             fn=add_point_from_original,
@@ -978,9 +1046,9 @@ def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_fe
         # 添加弹出窗口和状态提示功能
         def seg_gaussian_with_prompt(object_name, progress=gr.Progress(track_tqdm=True)):
             # 更新文本框状态为处理中
-            yield gr.update(value=f"正在处理 '{object_name}'...", interactive=False)
+            yield gr.update(value=f"Processing: '{object_name}'...", interactive=False)
             tool.seg_gaussian(threshold=0.7, object_name=object_name, progress=None)
-            yield gr.update(value="", placeholder="请输入对象名称", interactive=True)
+            yield gr.update(value="", placeholder="Your Object Name", interactive=True)
 
         # 修改保存按钮事件
         object_name_input.submit(
@@ -1005,7 +1073,7 @@ def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_fe
         def on_gallery_select(evt: gr.SelectData):
             try:
                 index = evt.index
-                image_name = list(images.keys())[index]
+                image_name = list(tool.images.keys())[index]
                 orig, mask, selected = tool.update_image(image_name)
                 # 获取当前可用的mask选项，保持mask选择
                 available_masks = get_available_mask_choices(tool)
@@ -1023,9 +1091,10 @@ def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_fe
 
         # 初始显示
         def init_display():
-            orig = tool._render_original()
-            mask = tool._render_mask()
-            selected = tool._render_selected_mask()
+            # orig = tool._render_original()
+            # mask = tool._render_mask()
+            # selected = tool._render_selected_mask()
+            orig, mask, selected = None, None, None
             available_masks = get_available_mask_choices(tool)
             return orig, mask, selected, gr.update(choices=available_masks, value=available_masks[0] if available_masks else None)
         
@@ -1036,34 +1105,38 @@ def create_gradio_interface(args, dataset, images, predictor, scene=None, sam_fe
 
 
 # python app.py --model_path <your_path_to_model>
+# I'm using this for trellis model segmentation
+# As it's a Y-Up generation model
+# output model would be lying down.
 
 if __name__ == "__main__":
-    model_path = '../TRELLIS/results/squirrel/25_04_27-12_22_04/model'
+
+    base_dir = "../TRELLIS/results"
+    default_model_paths = find_model_folders(base_dir)
 
     predictor = load_sam()
 
 
-    for i in range(1, len(sys.argv)):
-        if sys.argv[i] == "--model_path" and i+1 < len(sys.argv):
-            model_path = sys.argv[i+1]
-            break
+    # model_path = '../TRELLIS/results/squirrel/25_04_27-12_22_04/model'
+    # for i in range(1, len(sys.argv)):
+    #     if sys.argv[i] == "--model_path" and i+1 < len(sys.argv):
+    #         model_path = sys.argv[i+1]
+    #         break
     
-    scene, args, dataset, pipeline, background = load_gaussian_scene(model_path)
+    # scene, args, dataset, pipeline, background = load_gaussian_scene(model_path)
     
-    render_images = {}
-    for view in scene.getTrainCameras():
-        render_pkg = render(view, scene.gaussians, pipeline, background)
-        render_image = render_pkg["render"].permute(1, 2, 0).detach().cpu().numpy()
-        render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
-        render_images[view.image_name] = render_image
+    # render_images = {}
+    # for view in scene.getTrainCameras():
+    #     render_pkg = render(view, scene.gaussians, pipeline, background)
+    #     render_image = render_pkg["render"].permute(1, 2, 0).detach().cpu().numpy()
+    #     render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
+    #     render_images[view.image_name] = render_image
 
-    sam_features = extract_sam_features_pt(model_path, predictor, scene.getTrainCameras(), 
-                                          scene.gaussians, pipeline, background)
+    # sam_features = extract_sam_features_pt(model_path, predictor, scene.getTrainCameras(), 
+    #                                       scene.gaussians, pipeline, background)
     
     # 创建并启动Gradio界面，传入预先提取的特征和场景
-    demo = create_gradio_interface(args, dataset, render_images, predictor, scene, sam_features, pipeline, background)
+    demo = create_gradio_interface(default_model_paths, predictor)
     demo.launch(server_name="0.0.0.0", server_port=None,
-        allowed_paths = ["./", "../TRELLIS"])
-        # I'm using this for trellis model segmentation
-        # As it's a Y-Up generation model
-        # output model would be lying down.
+        allowed_paths = ["./", base_dir])
+
