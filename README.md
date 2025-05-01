@@ -2,10 +2,15 @@
 > [**Segment Anything in 3D Gaussians**](https://arxiv.org/abs/2401.17857)
 
 ## SAGS with a Gradio Interface
+
+#### 25.05.01
+Speedup x10 by change some numpy operator to torch, see app.py
+
+#### 25.04.30
 Use it to segment any gaussian easily, capable with multiview annotation ability.
 Text prompt would be release when I'm available.
 Undo and Redo might incur additional GPU Memory cost.
-Requires gradio>=5
+Requires gradio==5
 
 Gradio版本的SAGS，支持多视角标注，背面也可以加约束了。
 发现背面加约束这个事情有点鸡肋，猜测是3D投票过程并不能很好支持复杂的遮挡关系

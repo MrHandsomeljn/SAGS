@@ -30,9 +30,11 @@ from seg_utils import conv2d_matrix, compute_ratios, update
 from segment_anything import (SamAutomaticMaskGenerator, SamPredictor,
                               sam_model_registry)
 from gradio_litmodel3d import LitModel3D
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 pipeline, background = None, None
+empty_3D = torch.zeros((0,3),device='cuda')
 
 # 递归查找所有名为"model"的文件夹
 def find_model_folders(base_path, relative_to="."):
@@ -140,8 +142,8 @@ def extract_sam_features_pt(scene_path, predictor, cameras, gaussians):
 # region 3D投影操作
 
 ## Project 3D points to 2D plane
-def project_to_2d(viewpoint_camera, points3D):
-    full_matrix = viewpoint_camera.full_proj_transform  # w2c @ K 
+def project_to_2d(viewpoint_camera, points3D): # TODO: 做一个batch版本的
+    full_matrix = viewpoint_camera.full_proj_transform  # torch.cuda, w2c @ K 
     # project to image plane
     if points3D.shape[-1] != 4:
         points3D = F.pad(input=points3D, pad=(0, 1), mode='constant', value=1)
@@ -180,7 +182,7 @@ def get_3d_prompts(prompts_2d, point_image, xyz, depth=None):
 
 ## Given 1st view point prompts, find corresponding 3D Gaussian point prompts
 # 将3D点投影到2D，使得2D标注能映射到特定3D点上。
-def generate_3d_prompts(xyz, viewpoint_camera, prompts_2d):
+def generate_3d_prompts(xyz, viewpoint_camera, prompts_2d) -> torch.Tensor:
     w2c_matrix = viewpoint_camera.world_view_transform
     full_matrix = viewpoint_camera.full_proj_transform
     # project to image plane
@@ -190,22 +192,22 @@ def generate_3d_prompts(xyz, viewpoint_camera, prompts_2d):
     p_proj = p_hom[:3, :] * p_w
     # project to camera space
     p_view = (xyz @ w2c_matrix[:, :3]).transpose(0, 1)  # N, 3 -> 3, N
-    depth = p_view[-1, :].detach().clone()
+    depth = p_view[-1, :]
     valid_depth = depth >= 0
 
     h = viewpoint_camera.image_height
     w = viewpoint_camera.image_width
 
     point_image = 0.5 * ((p_proj[:2] + 1) * torch.tensor([w, h]).unsqueeze(-1).to(p_proj.device) - 1)
-    point_image = point_image.detach().clone()
     point_image = torch.round(point_image.transpose(0, 1)).long()
 
     prompts_2d = torch.tensor(prompts_2d).to("cuda")
-    prompts_3d = []
-    for i in range(prompts_2d.shape[0]): # 对每个标点，获取prompt，然后融合
-        prompts_3d.append(get_3d_prompts(prompts_2d[i], point_image, xyz, depth))
-    prompts_3D = torch.cat(prompts_3d, dim=0)
-    return prompts_3D.detach().cpu().numpy()
+    prompts_3d = torch.stack([
+        get_3d_prompts(prompts_2d[i], point_image, xyz, depth) 
+        for i in range(prompts_2d.shape[0])
+    ])
+    prompts_3D = prompts_3d.reshape(-1, prompts_3d.shape[-1])
+    return prompts_3D
 
 def mask_inverse(xyz, viewpoint_camera, sam_mask):
     w2c_matrix = viewpoint_camera.world_view_transform
@@ -215,27 +217,23 @@ def mask_inverse(xyz, viewpoint_camera, sam_mask):
     depth = p_view[-1, :].detach().clone()
     valid_depth = depth >= 0
 
-    h = viewpoint_camera.image_height
-    w = viewpoint_camera.image_width
+    h = viewpoint_camera.image_height # int
+    w = viewpoint_camera.image_width  # int
     
 
-    if sam_mask.shape[0] != h or sam_mask.shape[1] != w:
+    if sam_mask.shape[0] != h or sam_mask.shape[1] != w: # false
         sam_mask = func.resize(sam_mask.unsqueeze(0), (h, w), antialias=True).squeeze(0).long()
     else:
         sam_mask = sam_mask.long()
 
-    point_image = project_to_2d(viewpoint_camera, xyz) # [N,2]
+    point_image = project_to_2d(viewpoint_camera, xyz) # torch([N,2])
     point_image = point_image.long()
 
     # 判断x,y是否在图像范围之内
     valid_x = (point_image[:, 0] >= 0) & (point_image[:, 0] < w)
     valid_y = (point_image[:, 1] >= 0) & (point_image[:, 1] < h)
-    valid_mask = valid_x & valid_y & valid_depth
-    point_mask = torch.full((point_image.shape[0],), -1).to("cuda") # [N]=-1
-    # print(f"point_mask : {point_mask.shape} {point_mask.dtype} {point_mask.sum()}")
-    # print(f"valid_mask : {valid_mask.shape} {valid_mask.dtype} {valid_mask.sum()}")
-    # print(f"point_image: {point_image.shape} {point_image.dtype} {point_image.sum()}")
-
+    valid_mask = valid_x & valid_y & valid_depth # [N]=bool
+    point_mask = torch.full((point_image.shape[0],), -1, device="cuda") # [N]=-1
     point_mask[valid_mask] = sam_mask[point_image[valid_mask, 1], point_image[valid_mask, 0]] # [N]=sam_mask[x,y]
     indices_mask = torch.where(point_mask == 1)[0]
 
@@ -304,11 +302,11 @@ class GradioAnnotationTool:
         self.maskid = 0  # 将maskid移动到类实例变量
         self.seg2d_mark = {
             name: {
-                'points': [],       # 当前点标注
-                'masks': None,      # 当前掩码[id,H,W,C=1]
-                'history': [],      # 历史记录 [(points, masks), ...]
-                'history_index': -1, # 历史记录索引，用于撤销/重做
-                'prompts_3D': []    # 存储3D点标注
+                'points': [],                    # 当前点标注
+                'masks': None,                   # 当前掩码[id,H,W,C=1]
+                'history': [],                   # 历史记录 [(points, masks), ...]
+                'history_index': -1,             # 历史记录索引，用于撤销/重做
+                'prompts_3D': empty_3D.clone()   # 存储3D点标注
             } for name in self.images.keys()
         }
         self.multiview_mask = {
@@ -378,7 +376,7 @@ class GradioAnnotationTool:
                 'masks': None,
                 'history': [],
                 'history_index': -1,
-                'prompts_3D': []
+                'prompts_3D': empty_3D.clone()
             } for name in self.images.keys()
         }
         self.multiview_mask = {
@@ -421,7 +419,7 @@ class GradioAnnotationTool:
         if self.scene is not None:
             self._update_3d_prompts()
             
-        if mark['points']: self._get_mask()
+        if len(mark['points']): self._get_mask()
         self._save_state()
             
         return self._render_original(), self._render_mask(), self._render_selected_mask()
@@ -436,20 +434,20 @@ class GradioAnnotationTool:
             mark['history_index'] -= 1
             prev_state = mark['history'][mark['history_index']]
             mark['points'] = prev_state[0].copy() if prev_state[0] is not None else []
-            mark['masks'] = prev_state[1].copy() if prev_state[1] is not None else None
+            mark['masks']  = prev_state[1].copy() if prev_state[1] is not None else None
             # 恢复3D点标注
             if len(prev_state) > 2 and prev_state[2] is not None:
-                mark['prompts_3D'] = prev_state[2].copy() if prev_state[2] is not None else []
+                mark['prompts_3D'] = prev_state[2].copy() if prev_state[2] is not None else empty_3D.clone()
         else:
             mark["points"] = []
             mark["masks"] = None
-            mark["prompts_3D"] = []
+            mark["prompts_3D"] = empty_3D.clone()
             self._save_state()
 
         self._get_mask()
 
         # 如果场景存在，更新3D点标注
-        if self.scene is not None and mark['points']:
+        if self.scene is not None and len(mark['points']):
             self._update_3d_prompts()
             
         return self._render_original(), self._render_mask(), self._render_selected_mask()
@@ -463,12 +461,11 @@ class GradioAnnotationTool:
         if mark['history_index'] < len(mark['history']) - 1:
             mark['history_index'] += 1
             next_state = mark['history'][mark['history_index']]
-            mark['points'] = next_state[0].copy()
-            mark['masks'] = next_state[1].copy() if next_state[1] is not None else None
+            mark['points'] = next_state[0][:]
+            mark['masks'] = next_state[1].clone() if next_state[1] is not None else None
             # 恢复3D点标注
             if len(next_state) > 2 and next_state[2] is not None:
-                mark['prompts_3D'] = next_state[2].copy() if next_state[2] is not None else []
-        
+                mark['prompts_3D'] = next_state[2].clone() if next_state[2] is not None else empty_3D.clone()
             self._get_mask()
                 
         # 如果场景存在，更新3D点标注
@@ -487,7 +484,7 @@ class GradioAnnotationTool:
         mark = self.seg2d_mark[self.current_image]
         mark['points'] = []
         mark['masks'] = None
-        mark['prompts_3D'] = []  # 清空3D点标注
+        mark['prompts_3D'] = empty_3D.clone()  # 清空3D点标注
         self._save_state()
         self._get_mask()
         return self._render_original(), self._render_mask(), self._render_selected_mask()
@@ -495,11 +492,11 @@ class GradioAnnotationTool:
     def clear_all(self):
         self.seg2d_mark = {
             name: {
-                'points': [],       # 当前点标注
-                'masks': None,      # 当前掩码[id,H,W,C=1]
-                'history': [],      # 历史记录 [(points, masks), ...]
-                'history_index': -1, # 历史记录索引，用于撤销/重做
-                'prompts_3D': []    # 存储3D点标注
+                'points': [],                     # 当前点标注
+                'masks': None,                    # 当前掩码[id,H,W,C=1]
+                'history': [],                    # 历史记录 [(points, masks), ...]
+                'history_index': -1,              # 历史记录索引，用于撤销/重做
+                'prompts_3D': empty_3D.clone()    # 存储3D点标注
             } for name in self.images.keys()
         }
         self.multiview_mask = {
@@ -512,7 +509,7 @@ class GradioAnnotationTool:
         """更新当前图像的3D点标注"""
         mark = self.seg2d_mark[self.current_image]
         if not mark['points'] or self.scene is None:
-            mark['prompts_3D'] = []
+            mark['prompts_3D'] = empty_3D.clone()
             return
             
         # 获取当前视角的相机
@@ -547,41 +544,82 @@ class GradioAnnotationTool:
 
     def generate_multiview_masks(self, prompts_3D, text_prompt = None, progress:gr.Progress=None):
         """
-        sam_mask        (cuda) : list[torch.int64(id,H,W)] , 每个视角下的渲染图的sam mask
-        multiview_masks (cuda) : list[torch.int64(N,1)]    , 每个视角下，每个Gaussians点的mask  
+        sam_mask_all_levels (cuda) : list[torch.int64(id,H,W)] , 每个视角下的渲染图的sam mask
+        sam_masks           (cuda) : list[torch.int64(H,W)]    , 每个视角下的渲染图的sam mask
+        multiview_masks     (cuda) : list[torch.int64(N,1)]    , 每个视角下，每个Gaussians点的mask  
         """
-        # text guided, masks[id,H,W,C=1]
-        def text_prompt_seg(image, text):
-            input_boxes = grounding_dino_prompt(image, text)
-
-            boxes = torch.tensor(input_boxes)[0:1].cuda()
-            transformed_boxes = predictor.transform.apply_boxes_torch(boxes, image.shape[:2])
-            masks,  _, _ = predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=True,
-            )
-            masks = masks[0].cpu().numpy()
-            return (masks[:, :, :, None]*255).astype(np.uint8) / 255 # id,H,W,1
 
         # point guided, masks[id,H,W,C=1], 2D点标注
-        def self_prompt_seg(point_prompts, sam_feature):
-            input_point = point_prompts.detach().cpu().numpy()
-            # input_point = input_point[::-1]
-            input_label = np.ones(len(input_point))
+        def self_prompt_seg_torch(point_prompts, sam_feature): # point_prompts: torch([N,2])
+            input_point = point_prompts[None, :, :] # Batch, N, 2
+            input_label = torch.ones((input_point.shape[0],input_point.shape[1]), device=self.predictor.device)
 
             predictor.features = sam_feature
-            masks, _, _ = predictor.predict(
-                point_coords=input_point,
-                point_labels=input_label,
+            masks_torch_batch, _, _ = predictor.predict_torch(
+                point_coords=input_point, # [1,N,2]
+                point_labels=input_label, # [1,N]
                 multimask_output=True,
             )
-            # return_mask = (masks[ :, :, 0]*255).astype(np.uint8)
-            # return_mask = (masks[id, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
-            return_mask = (masks[:, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
-
+            masks_torch = masks_torch_batch[0] # [batch, id, H, W, C]
+            return_mask = (masks_torch[:, :, :, None]*255).to(torch.uint8) # [id,H,W,C=1]
             return return_mask / 255
+        
+        scene = self.scene
+        images = self.images
+        mask_id = self.maskid
+        cameras = scene.getTrainCameras()
+        gaussians = scene.gaussians
+        sam_masks = []
+        multiview_masks = []
+        sam_mask_all_levels = []
+        for i, view in tqdm(enumerate(cameras), desc="generate multiview masks"):
+            image_name = view.image_name # added
+            prompts_2d = project_to_2d(view, prompts_3D)
+            sam_mask_all_level = self_prompt_seg_torch(prompts_2d, self.sam_features[image_name]) # torch([id=3,H,W,C=1])
+            sam_mask_all_levels.append(sam_mask_all_level)
+            sam_mask = sam_mask_all_level[mask_id].long()[:,:,0] # torch[H,W]
+            sam_masks.append(sam_mask)
+            point_mask, indices_mask = mask_inverse(gaussians.get_xyz, view, sam_mask) # TODO: gaussians.get_xyz.require_grad=True; cuda,cuda,cuda
+            multiview_masks.append(point_mask.unsqueeze(-1))
+        return sam_mask_all_levels, sam_masks, multiview_masks
+
+    # def generate_multiview_masks(self, prompts_3D, text_prompt = None, progress:gr.Progress=None):
+    #     """
+    #     sam_mask        (cuda) : list[torch.int64(id,H,W)] , 每个视角下的渲染图的sam mask
+    #     multiview_masks (cuda) : list[torch.int64(N,1)]    , 每个视角下，每个Gaussians点的mask  
+    #     """
+    #     # text guided, masks[id,H,W,C=1]
+    #     def text_prompt_seg(image, text):
+    #         input_boxes = grounding_dino_prompt(image, text)
+
+    #         boxes = torch.tensor(input_boxes)[0:1].cuda()
+    #         transformed_boxes = predictor.transform.apply_boxes_torch(boxes, image.shape[:2])
+    #         masks,  _, _ = predictor.predict_torch(
+    #             point_coords=None,
+    #             point_labels=None,
+    #             boxes=transformed_boxes,
+    #             multimask_output=True,
+    #         )
+    #         masks = masks[0].cpu().numpy()
+    #         return (masks[:, :, :, None]*255).astype(np.uint8) / 255 # id,H,W,1
+
+    #     # point guided, masks[id,H,W,C=1], 2D点标注
+    #     def self_prompt_seg(point_prompts, sam_feature):
+    #         input_point = point_prompts.detach().cpu().numpy()
+    #         # input_point = input_point[::-1]
+    #         input_label = np.ones(len(input_point))
+
+    #         predictor.features = sam_feature
+    #         masks, _, _ = predictor.predict(
+    #             point_coords=input_point,
+    #             point_labels=input_label,
+    #             multimask_output=True,
+    #         )
+    #         # return_mask = (masks[ :, :, 0]*255).astype(np.uint8)
+    #         # return_mask = (masks[id, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
+    #         return_mask = (masks[:, :, :, None]*255).astype(np.uint8) # id,H,W,C=1
+
+    #         return return_mask / 255
         
         
         scene = self.scene
@@ -592,6 +630,7 @@ class GradioAnnotationTool:
         sam_masks = []
         multiview_masks = []
         sam_mask_all_levels = []
+
         for i, view in tqdm(enumerate(cameras), desc="generate multiview masks"):
             image_name = view.image_name # added
             if text_prompt is not None:
@@ -607,14 +646,11 @@ class GradioAnnotationTool:
             sam_mask = sam_mask_all_level[mask_id]
             if len(sam_mask.shape) != 2: sam_mask = torch.from_numpy(sam_mask).squeeze(-1).to("cuda")
             else: sam_mask = torch.from_numpy(sam_mask).to("cuda")
-            sam_mask = sam_mask.long() # 2D mask image
+            sam_mask = sam_mask.long() # 2D mask image [H,W] -> value
             sam_masks.append(sam_mask)
             
-            # print(f"sam_mask {sam_mask.shape} {sam_mask.dtype}")
-            # mask assignment to gaussians
             point_mask, indices_mask = mask_inverse(gaussians.get_xyz, view, sam_mask)
             multiview_masks.append(point_mask.unsqueeze(-1))
-
         return sam_mask_all_levels, sam_masks, multiview_masks
 
     def _get_mask(self, match_mask_id = False, progress:gr.Progress=None):
@@ -632,27 +668,24 @@ class GradioAnnotationTool:
         # 收集prompts_3D
         prompts_3D_list = []
         for img_name in self.images.keys():
-            if len(self.seg2d_mark[img_name]["prompts_3D"]):  # 检查是否有3D点标注
-                points = np.array(self.seg2d_mark[img_name]["prompts_3D"])
-                if len(points.shape) == 1:  # 如果是(3,)则转为(1,3)
-                    points = points[np.newaxis, :]
-                prompts_3D_list.append(points)
-        if prompts_3D_list:
-            prompts_3D = np.vstack(prompts_3D_list)  # 最终形状为(M,3)
-            prompts_3D_tensor = torch.tensor(prompts_3D, dtype=torch.float32).to("cuda")
-        else:
-            prompts_3D = np.zeros((0,3))
-            prompts_3D_tensor = torch.empty((0, 3), dtype=torch.float32).to("cuda")
+            prompts_3D = self.seg2d_mark[img_name]["prompts_3D"]  # torch.Tensor[N,3]
+            if prompts_3D.shape[0] > 0:  # 检查是否有3D点标注
+                prompts_3D_list.append(prompts_3D)
+        
+        if prompts_3D_list: prompts_3D_tensor = torch.cat(prompts_3D_list, dim=0)  # [M,3]
+        else: prompts_3D_tensor = torch.empty((0, 3), dtype=torch.float32, device="cuda")
 
-        print("Prompt 3D: ",prompts_3D)
+        print("Prompt 3D: ",prompts_3D_tensor)
         print("Prompt maskid: ",self.maskid)
 
         if progress is not None: progress(0.1, desc="matching cached multiview mask")
 
         # 匹配
-        def _is_same_prompt(p1, p2, tol=1e-4):
+        def _is_same_prompt(p1, p2, tol=1e-5):
             if p1.shape != p2.shape: return False
-            return torch.allclose(p1, p2, atol=tol)
+            p1_sorted = torch.sort(p1, dim=0)[0]
+            p2_sorted = torch.sort(p2, dim=0)[0]
+            return torch.allclose(p1_sorted, p2_sorted, atol=tol)
         
         matched_index = None
         for i, rec in enumerate(self.multiview_mask["records"]):
@@ -705,9 +738,9 @@ class GradioAnnotationTool:
         
         # 创建当前状态的副本，不再包含maskid
         current_state = (
-            mark['points'].copy() if mark['points'] else [],
-            mark['masks'].copy() if mark['masks'] is not None else None,
-            mark['prompts_3D'].copy() if 'prompts_3D' in mark and mark['prompts_3D'] is not None else []
+            mark['points'][:]          if mark['points'] else [],                     # list[N,2] -> int
+            mark['masks'].clone()      if mark['masks'] is not None else None,        # list[nImage] -> Tensor[3,H,W]
+            mark['prompts_3D'].clone() if 'prompts_3D' in mark else empty_3D.clone()  # Tensor[N,3]
         )
         
         # 如果当前不是在历史记录的最后，则截断历史记录
@@ -752,6 +785,7 @@ class GradioAnnotationTool:
         
         # 绘制mask
         if mark['masks'] is not None and len(mark['masks']) > 0:
+            mask_multilayer = mark['masks'].cpu().numpy()
             # 定义三种颜色 - 使用更鲜艳的颜色
             mask_colors = [
                 np.array([255, 50, 50]),    # 红色
@@ -768,9 +802,9 @@ class GradioAnnotationTool:
             priority_mask = np.ones(img.shape[:2], dtype=np.int32) * 999
             
             # 从小到大处理mask，确保小的mask优先显示
-            masks_count = min(len(mark['masks']), len(mask_colors))
+            masks_count = min(len(mask_multilayer), len(mask_colors))
             for i in range(masks_count):
-                mask = mark['masks'][i]
+                mask = mask_multilayer[i]
                 mask_area = mask > 0.5
                 
                 # 只处理优先级更高的区域（即尚未被更小的mask覆盖的区域）
@@ -810,10 +844,11 @@ class GradioAnnotationTool:
         
         # 绘制选中的mask
         if mark['masks'] is not None and len(mark['masks']) > 0:
+            mask_multilayer = mark['masks'].cpu().numpy()
             mask_id = self.maskid  # 使用类实例变量
-            if mask_id < len(mark['masks']):
+            if mask_id < len(mask_multilayer):
                 # 获取选中的mask
-                mask = mark['masks'][mask_id]
+                mask = mask_multilayer[mask_id]
                 mask_area = mask > 0.5
                 
                 # 定义mask颜色
@@ -828,14 +863,7 @@ class GradioAnnotationTool:
                 # 应用mask到原图
                 if np.any(mask_area):
                     img[mask_area] = mask_color * mask_color_strength + img[mask_area] * (1-mask_color_strength)
-                
-                # 添加mask标题
-                # mask_names = ["small", "middle", "large"]
-                # title = f"选中的Mask: {mask_names[mask_id]}"
-                # cv2.putText(img, title, (10, 30), 
-                #         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                # cv2.putText(img, title, (10, 30), 
-                #         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+
         else: print(f"mask invalid: {mark['masks']}")
         return img
 
@@ -909,22 +937,18 @@ def create_gradio_interface(default_model_paths, predictor):
     
     with gr.Blocks() as demo:
         with gr.Row():
-            with gr.Column(scale=2):
+            with gr.Column(scale=1):
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        original_display = gr.Image(label="Origin", interactive=True)
-                    with gr.Column(scale=1):
-                        mask_display = gr.Image(label="Layer Mask", interactive=True)
-                
+                    original_display = gr.Image(label="Origin", interactive=False)
                 with gr.Row():
-                    with gr.Column(scale=2):
-                        with gr.Row():
-                            undo_btn = gr.Button("Undo")
-                            redo_btn = gr.Button("Redo")
-                            cls_cur_btn = gr.Button("Clear Curr View Marks")
-                            cls_all_btn = gr.Button("Clear All Views Marks")
-                            # save_btn = gr.Button("保存分割")
-
+                    undo_btn = gr.Button("Undo")
+                    redo_btn = gr.Button("Redo")
+            with gr.Column(scale=1):
+                with gr.Row():
+                    mask_display = gr.Image(label="Layer Mask", interactive=False)
+                with gr.Row():
+                    cls_cur_btn = gr.Button("Clear Curr View Marks")
+                    cls_all_btn = gr.Button("Clear All Views Marks")
             with gr.Column(scale=1):
                 with gr.Row():
                     selected_mask_display = gr.Image(label="Mask Result", interactive=False)
@@ -933,7 +957,7 @@ def create_gradio_interface(default_model_paths, predictor):
                         choices=["S", "M", "L"], 
                         label="Select Mask", 
                         value="S",
-                        interactive=True  # 确保交互性
+                        interactive=True
                     )
         with gr.Row() as prompt_col:
             with gr.Column(scale=1):
@@ -1091,9 +1115,6 @@ def create_gradio_interface(default_model_paths, predictor):
 
         # 初始显示
         def init_display():
-            # orig = tool._render_original()
-            # mask = tool._render_mask()
-            # selected = tool._render_selected_mask()
             orig, mask, selected = None, None, None
             available_masks = get_available_mask_choices(tool)
             return orig, mask, selected, gr.update(choices=available_masks, value=available_masks[0] if available_masks else None)
@@ -1111,32 +1132,14 @@ def create_gradio_interface(default_model_paths, predictor):
 
 if __name__ == "__main__":
 
-    base_dir = "../TRELLIS/results"
-    default_model_paths = find_model_folders(base_dir)
+    # with profile(on_trace_ready=torch.profiler.tensorboard_trace_handler('./log')) as prof:
+        base_dir = "../TRELLIS/results"
+        default_model_paths = find_model_folders(base_dir)
 
-    predictor = load_sam()
+        predictor = load_sam()
 
-
-    # model_path = '../TRELLIS/results/squirrel/25_04_27-12_22_04/model'
-    # for i in range(1, len(sys.argv)):
-    #     if sys.argv[i] == "--model_path" and i+1 < len(sys.argv):
-    #         model_path = sys.argv[i+1]
-    #         break
-    
-    # scene, args, dataset, pipeline, background = load_gaussian_scene(model_path)
-    
-    # render_images = {}
-    # for view in scene.getTrainCameras():
-    #     render_pkg = render(view, scene.gaussians, pipeline, background)
-    #     render_image = render_pkg["render"].permute(1, 2, 0).detach().cpu().numpy()
-    #     render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
-    #     render_images[view.image_name] = render_image
-
-    # sam_features = extract_sam_features_pt(model_path, predictor, scene.getTrainCameras(), 
-    #                                       scene.gaussians, pipeline, background)
-    
-    # 创建并启动Gradio界面，传入预先提取的特征和场景
-    demo = create_gradio_interface(default_model_paths, predictor)
-    demo.launch(server_name="0.0.0.0", server_port=None,
-        allowed_paths = ["./", base_dir])
+        # 创建并启动Gradio界面，传入预先提取的特征和场景
+        demo = create_gradio_interface(default_model_paths, predictor)
+        demo.launch(server_name="0.0.0.0", server_port=None,
+            allowed_paths = ["./", base_dir])
 
