@@ -4,7 +4,8 @@
 ## SAGS with a Gradio Interface
 
 #### 25.05.01
-Speedup x10 by change some numpy operator to torch, see app.py
+Speedup x10 (in multi view segment) by change some numpy operator to torch, see app.py
+every single click need 1800MB GPU Memory. I will fix it.
 
 #### 25.04.30
 Use it to segment any gaussian easily, capable with multiview annotation ability.
