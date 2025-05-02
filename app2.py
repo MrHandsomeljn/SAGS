@@ -502,68 +502,6 @@ class GradioAnnotationTool:
             self._get_mask()
         return self._render_display()
 
-    def generate_multiview_masks_batch(self, prompts_3D, text_prompt = None, progress:gr.Progress=None):
-        """
-        sam_mask_all_levels (cuda) : list[torch.int64(id,H,W)] , 每个视角下的渲染图的sam mask
-        sam_masks           (cuda) : list[torch.int64(H,W)]    , 每个视角下的渲染图的sam mask
-        multiview_masks     (cuda) : list[torch.int64(N,1)]    , 每个视角下，每个Gaussians点的mask  
-        """
-
-        # point guided, masks[id,H,W,C=1], 2D点标注
-        def self_prompt_seg_torch(point_prompts, sam_feature): # point_prompts: torch([N,2])
-            input_point = point_prompts[None, :, :] # Batch, N, 2
-            input_label = torch.ones((input_point.shape[0],input_point.shape[1]), device=self.predictor.device)
-
-            predictor.features = sam_feature
-            masks_torch_batch, _, _ = predictor.predict_torch(
-                point_coords=input_point, # [1,N,2]
-                point_labels=input_label, # [1,N]
-                multimask_output=True,
-            )
-            masks_torch = masks_torch_batch[0] # [batch, id, H, W, C]
-            return_mask = (masks_torch[:, :, :, None]*255).to(torch.uint8) # [id,H,W,C=1]
-            return return_mask / 255
-        
-        # point guided, masks[id,H,W,C=1], 2D点标注
-        def self_prompt_seg_batch(point_prompts, sam_feature): 
-            # point_prompts: torch([nCam, N,2])
-            # sam_features : torch([nCam, C,H,W])
-            input_point = point_prompts[None, :, :] # Batch, N, 2
-            input_label = torch.ones((input_point.shape[0],input_point.shape[1]), device=self.predictor.device)
-
-            predictor.features = sam_feature
-            masks_torch_batch, _, _ = predictor.predict_torch(
-                point_coords=input_point, # [1,N,2]
-                point_labels=input_label, # [1,N]
-                multimask_output=True,
-            )
-            masks_torch = masks_torch_batch[0] # [batch, id, H, W, C]
-            return_mask = (masks_torch[:, :, :, None]*255).to(torch.uint8) # [id,H,W,C=1]
-            return return_mask / 255
-
-        scene = self.scene
-        images = self.images
-        mask_id = self.maskid
-        cameras = scene.getTrainCameras()
-        gaussians = scene.gaussians
-        sam_masks = []
-        multiview_masks = []
-        sam_mask_all_levels = []
-        prompts_2ds = project_to_2d_batch(cameras, prompts_3D) # [nCameras, N, 2]
-        sam_features = torch.stack([self.sam_features[v.image_name] for v in cameras]) # [nCameras, C, H, W]
-        sam_mask_all_level = self_prompt_seg_torch(prompts_2d, self.sam_features[image_name])
-
-        for i, view in tqdm(enumerate(cameras), desc="generate multiview masks"):
-            image_name = view.image_name # added
-            prompts_2d = project_to_2d(view, prompts_3D)
-            sam_mask_all_level = self_prompt_seg_torch(prompts_2d, self.sam_features[image_name]) # torch([id=3,H,W,C=1])
-            sam_mask_all_levels.append(sam_mask_all_level)
-            sam_mask = sam_mask_all_level[mask_id].long()[:,:,0] # torch[H,W]
-            sam_masks.append(sam_mask)
-            point_mask, indices_mask = mask_inverse(gaussians.get_xyz, view, sam_mask) # TODO: gaussians.get_xyz.require_grad=True; cuda,cuda,cuda
-            multiview_masks.append(point_mask.unsqueeze(-1))
-        return sam_mask_all_levels, sam_masks, multiview_masks
-
     def generate_multiview_masks(self, prompts_3D, text_prompt = None, progress:gr.Progress=None):
         """
         sam_mask_all_levels (cuda) : list[torch.int64(id,H,W)] , 每个视角下的渲染图的sam mask
@@ -833,21 +771,27 @@ def create_gradio_interface(default_model_paths, predictor):
     
     with gr.Blocks() as demo:
         with gr.Row():
+            original_display = gr.Image(label="Origin", interactive=False)
+            mask_display = gr.Image(label="Layer Mask", interactive=False)
+            selected_mask_display = gr.Image(label="Mask Result", interactive=False)
+        with gr.Row():
             with gr.Column(scale=1):
-                with gr.Row():
-                    original_display = gr.Image(label="Origin", interactive=False)
                 with gr.Row():
                     undo_btn = gr.Button("Undo")
                     redo_btn = gr.Button("Redo")
-            with gr.Column(scale=1):
                 with gr.Row():
-                    mask_display = gr.Image(label="Layer Mask", interactive=False)
+                    seg_view = gr.Button("Seg View")
+                    add_view = gr.Button("Add to Result")
+
+            with gr.Column(scale=1):
                 with gr.Row():
                     cls_cur_btn = gr.Button("Clear Curr View Marks")
                     cls_all_btn = gr.Button("Clear All Views Marks")
-            with gr.Column(scale=1):
                 with gr.Row():
-                    selected_mask_display = gr.Image(label="Mask Result", interactive=False)
+                    seg_view = gr.Button("Save Checkpoint")
+                    seg_view = gr.Button("Clear Result")
+
+            with gr.Column(scale=1):
                 with gr.Row():
                     mask_selector = gr.Radio(
                         choices=["S", "M", "L"], 
@@ -881,19 +825,16 @@ def create_gradio_interface(default_model_paths, predictor):
                     allow_preview=False,
                 )
             with gr.Column(scale=1):
-                with gr.Row(): fg_gs = LitModel3D(label="Foreground", exposure=10.0, height=300)
+                with gr.Row(): fg_gs = LitModel3D(label="Current View Segment", exposure=10.0, height=300)
                 with gr.Row(): download_fg_gs = gr.DownloadButton(label="Download", interactive=False)
-            # with gr.Column(scale=1):
-            #     with gr.Row(): bg_gs = LitModel3D(label="Background", exposure=10.0, height=300)
-            #     with gr.Row(): download_bg_gs = gr.DownloadButton(label="Download", interactive=False)
+            with gr.Column(scale=1):
+                with gr.Row(): bg_gs = LitModel3D(label="Final Segment", exposure=10.0, height=300)
+                with gr.Row(): download_bg_gs = gr.DownloadButton(label="Download", interactive=False)
         
-        # 处理mask选择
         def on_mask_select(choice):
             if choice == "S": mask_id = 0
             elif choice == "M": mask_id = 1
             elif choice == "L": mask_id = 2
-            
-            # 调用set_mask_id方法并返回最右侧图像
             selected_mask = tool.set_mask_id(mask_id)
             return selected_mask
         
