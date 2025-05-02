@@ -316,6 +316,7 @@ class GradioAnnotationTool:
         
         if self.scene is not None: del self.scene
         if self.seg2d_mark is not None: del self.seg2d_mark
+        if self.multiview_mask is not None: del self.multiview_mask
 
         print("Loading Gaussian Scene")
         if progress is not None: progress(0, desc="Get Args")
@@ -391,7 +392,7 @@ class GradioAnnotationTool:
         if self.scene is not None:
             self._update_3d_prompts()
             
-        self._get_mask()
+        if len(mark['points']): self._get_mask()
         self._save_state()
         self._new_loaded = False
         return self._render_original(), self._render_mask(), self._render_selected_mask()
@@ -412,12 +413,15 @@ class GradioAnnotationTool:
         else:
             mark["points"] = []
             mark['prompts_3D'] = empty_3D.clone()
+            self._new_loaded = True
             self._save_state()
 
         self._get_mask()
 
         # 如果场景存在，更新3D点标注
-        if self.scene is not None and len(mark['points']): self._update_3d_prompts()
+        if self.scene is not None and len(mark['points']):
+            self._update_3d_prompts()
+            
         return self._render_original(), self._render_mask(), self._render_selected_mask()
 
     def redo(self):
@@ -436,7 +440,9 @@ class GradioAnnotationTool:
             self._get_mask()
                 
         # 如果场景存在，更新3D点标注
-        if self.scene is not None and len(mark['points']): self._update_3d_prompts()
+        if self.scene is not None and mark['points']:
+            self._update_3d_prompts()
+            
         return self._render_original(), self._render_mask(), self._render_selected_mask()
 
     def set_mask_id(self, mask_id):
@@ -462,15 +468,19 @@ class GradioAnnotationTool:
                 'prompts_3D': empty_3D.clone()    # 存储3D点标注
             } for name in self.images.keys()
         }
-        self.record = { # 每次点击，根据不同的点击组合，会创建一个record结构。
-            "prompts": None,              # torch.Tensor([N, 3]), 保存用于生成该记录的 3D 点
-            "mvmask": {
-                # maskid1: {
-                #     "multiview": {...}, # multiview_masks     (用于3D分割)
-                #     "sam_masks": {...}, # multiview_sam_masks (用于3D分割)
-                # }
-            },
-            "sam_all": {}                 # {img1_name: mask1, ...}（用于可视化）
+        self.multiview_mask = {
+            "records": [],      # 每条记录结构如下（见下方）：
+            "current_index": -1 # 指向当前激活的记录，初始为 -1 表示无记录
+            # records = { # 每次点击，根据不同的点击组合，会创建一个records结构。
+            #     "prompts": torch.Tensor([N, 3]),                 # 保存用于生成该记录的 3D 点
+            #     "mvmask": {
+            #         maskid1: {
+            #             "multiview": {...},                       # multiview_masks     (用于3D分割)
+            #             "sam_masks": {...},                       # multiview_sam_masks (用于3D分割)
+            #         }
+            #     }
+            #     "sam_all": {img1_name: mask1, img2_name: mask2}  # sam_mask_all_levels（用于可视化）
+            # }
         }
         self._new_loaded = True
 
@@ -648,21 +658,7 @@ class GradioAnnotationTool:
             multiview_masks.append(point_mask.unsqueeze(-1))
         return sam_mask_all_levels, sam_masks, multiview_masks
 
-    def _get_multilayer_mask(self, img_name):
-        if self._new_loaded: return None
-        return self.record["sam_all"].get(img_name)
-
-    def _get_mask(self, progress:gr.Progress=None):
-        """
-        根据prompts_3D和maskid作为索引，保存multiview_sam_masks, multiview_masks
-        根据prompts_3D作为索引，保存sam_mask_all_level
-        其中prompts_3D为[N,3]的3D点集，索引过程中不需要保证点集顺序一致，对于十分相近的点认为是同一个点。
-        历史记录不再依赖栈结构，而是点集匹配。
-
-        sam_mask_all_level : 用于显示,不需要mask_id(显示时做筛选)
-        multiview_sam_masks: 是选中的mask,用于3D分割,需要mask_id
-        multiview_masks    : 是3D点的mask,用于3D分割,需要mask_id
-        """
+    def _match_current_index_from_record(self):
         # 收集prompts_3D
         prompts_3D_list = []
         for img_name in self.images.keys():
@@ -673,21 +669,67 @@ class GradioAnnotationTool:
         if prompts_3D_list: prompts_3D_tensor = torch.cat(prompts_3D_list, dim=0)  # [M,3]
         else: prompts_3D_tensor = torch.empty((0, 3), dtype=torch.float32, device="cuda")
 
+        def _is_same_prompt(p1, p2, tol=1e-5):
+            if p1.shape != p2.shape: return False
+            p1_sorted = torch.sort(p1, dim=0)[0]
+            p2_sorted = torch.sort(p2, dim=0)[0]
+            return torch.allclose(p1_sorted, p2_sorted, atol=tol)
+        
+        for index, rec in enumerate(self.multiview_mask["records"]):
+            if _is_same_prompt(rec["prompts"], prompts_3D_tensor):
+                return prompts_3D_tensor, index
+        return prompts_3D_tensor, None
+
+    def _get_multilayer_mask(self, img_name):
+        if self._new_loaded: return None
+        return self.multiview_mask["records"][self._get_mask()]["sam_all"].get(img_name)
+
+    def _get_mask(self, match_mask_id = False, progress:gr.Progress=None):
+        """
+        根据prompts_3D和maskid作为索引，保存multiview_sam_masks, multiview_masks
+        根据prompts_3D作为索引，保存sam_mask_all_level
+        其中prompts_3D为[N,3]的3D点集，索引过程中不需要保证点集顺序一致，对于十分相近的点认为是同一个点。
+        历史记录不再依赖栈结构，而是点集匹配。
+
+        sam_mask_all_level : 用于显示,不需要mask_id(显示时做筛选)
+        multiview_sam_masks: 是选中的mask,用于3D分割,需要mask_id
+        multiview_masks    : 是3D点的mask,用于3D分割,需要mask_id
+        """
         if progress is not None: progress(0, desc="prepare Prompt 3D")
-        sam_alls, sam_masks, multiviews = self.generate_multiview_masks(prompts_3D_tensor, progress=progress)
-        print("multiview_masks generated\n")
-        sam_all_dict = { # img_name -> torch.tensor(id,H,W), 仅显示时转numpy
-            img: m.squeeze(-1) if m is not None else None
-            for img, m in zip(self.images.keys(), sam_alls)
-        }
-        self.record["prompts"] = prompts_3D_tensor
-        self.record["sam_all"] = sam_all_dict
-        self.record["mvmask"][self.maskid] = {
-            "multiview": multiviews,
-            "sam_masks": sam_masks,
-        }
-        log()
-        return
+        prompts_3D_tensor, matched_index = self._match_current_index_from_record()
+
+        # --- 若找到记录且包含当前 maskid，直接复用 ---
+        if matched_index is not None and (not match_mask_id or self.maskid in self.multiview_mask["records"][matched_index]["mvmask"]):
+            self.multiview_mask["current_index"] = matched_index
+            return matched_index
+
+        # --- 没有命中，生成新的 ---
+        else:
+            sam_alls, sam_masks, multiviews = self.generate_multiview_masks(prompts_3D_tensor, progress=progress)
+            print("multiview_masks generated\n")
+
+            # 组装 sam_all 字典
+            sam_all_dict = {
+                img: m.squeeze(-1) if m is not None else None
+                for img, m in zip(self.images.keys(), sam_alls) # img_name -> torch.tensor(id,H,W), 仅显示时转numpy
+            }
+
+            # --- 写入记录 ---
+            if matched_index is not None:
+                record = self.multiview_mask["records"][matched_index]
+            else:
+                record = {"prompts": prompts_3D_tensor, "mvmask": {}, "sam_all": sam_all_dict}
+                self.multiview_mask["records"].append(record)
+                matched_index = len(self.multiview_mask["records"]) - 1
+
+            record["mvmask"][self.maskid] = {
+                "multiview": multiviews,
+                "sam_masks": sam_masks,
+            }
+            record["sam_all"] = sam_all_dict
+            self.multiview_mask["current_index"] = matched_index
+            log()
+            return matched_index
 
     def _save_state(self):
         """保存当前状态到历史记录"""
@@ -758,9 +800,8 @@ class GradioAnnotationTool:
             img[mask_any] = combined_mask[mask_any]
 
         except Exception as e:
-            if not self._new_loaded:
-                print(f"Mask invalid: {self.current_image}")
-                print(e)
+            print(f"Mask invalid: {self.current_image}")
+            print(e)
 
         for i, (x, y) in enumerate(mark['points']):
             cv2.circle(img, (x, y), 8, (0, 0, 0), -1)
@@ -791,14 +832,13 @@ class GradioAnnotationTool:
                 if np.any(mask_area):
                     img[mask_area] = mask_color * mask_color_strength + img[mask_area] * (1-mask_color_strength)
         except Exception as e:
-            if not self._new_loaded:
-                print(f"Mask invalid: {self.current_image}")
-                print(e)
+            print(f"Mask invalid: {self.current_image}")
+            print(e)
         return img
 
     ## Multi-view label voting 多视角（multi-view）标签投票融合
     def ensemble(self, threshold=0.7):
-        multiview_masks = self.record["mvmask"][self.maskid]["multiview"]
+        multiview_masks = self.multiview_mask["records"][self.multiview_mask["current_index"]]["mvmask"][self.maskid]["multiview"]
         multiview_masks = torch.cat(multiview_masks, dim=1)
         vote_labels,_ = torch.mode(multiview_masks, dim=1)
         # # select points with score > threshold 
@@ -812,7 +852,7 @@ class GradioAnnotationTool:
 
     def seg_gaussian(self, threshold, object_name, progress:gr.Progress = None):
         if progress is not None: progress(0, desc="load gaussians and mask")
-        self._get_mask(progress=progress) # 需要match maskid
+        self._get_mask(match_mask_id=True, progress=progress) # 需要match maskid
         model_path = self.scene.model_path
         gaussians = self.scene.gaussians
         _, final_mask = self.ensemble(threshold)
@@ -828,7 +868,7 @@ class GradioAnnotationTool:
         de_gaussian = self.load_scene_gaussians()
         for i, view in tqdm(enumerate(cameras), desc="gaussian multiview decomp"):
             if self.args.gd_interval != -1 and i % self.args.gd_interval == 0:
-                input_mask = self.record["mvmask"][self.maskid]["sam_masks"][i]
+                input_mask = self.multiview_mask["records"][self.multiview_mask["current_index"]]["mvmask"][self.maskid]["sam_masks"][i]
                 de_gaussian = gaussian_decomp(de_gaussian, view, input_mask, final_mask.to('cuda'))
         if progress is not None: progress(0.5, desc="render segged gaussian")
 
@@ -889,7 +929,7 @@ def create_gradio_interface(default_model_paths, predictor):
                         interactive=True
                     )
         with gr.Row() as prompt_col:
-            with gr.Column(scale=1.5):
+            with gr.Column(scale=1):
                 model_path_input = gr.Dropdown(
                     choices=default_model_paths,
                     allow_custom_value=True,
@@ -906,11 +946,10 @@ def create_gradio_interface(default_model_paths, predictor):
             with gr.Column(scale=2):
                 gallery = gr.Gallery(
                     label="Gallery",
-                    value=[(tool.images[k],k) for k in sorted(tool.images.keys(), key=lambda x: int(x) if x.isdigit() else x)],
+                    value=[tool.images[k] for k in sorted(tool.images.keys(), key=lambda x: int(x) if x.isdigit() else x)],
                     columns=4,
                     object_fit="contain",
-                    height="auto",
-                    allow_preview=False,
+                    height="auto"
                 )
             with gr.Column(scale=1):
                 with gr.Row(): fg_gs = LitModel3D(label="Foreground", exposure=10.0, height=300)
@@ -962,7 +1001,7 @@ def create_gradio_interface(default_model_paths, predictor):
             selected = tool._render_selected_mask()
             available_masks = get_available_mask_choices(tool)
             return \
-                gr.update(value = [(tool.images[k],k) for k in sorted(tool.images.keys(), key=lambda x: int(x) if x.isdigit() else x)]),\
+                gr.update(value = list(tool.images.values())),\
                 orig, mask, selected, \
                 gr.update(choices=available_masks, value=available_masks[0] if available_masks else None)
 
@@ -1020,7 +1059,7 @@ def create_gradio_interface(default_model_paths, predictor):
         def on_gallery_select(evt: gr.SelectData):
             try:
                 index = evt.index
-                image_name = sorted(tool.images.keys(), key=lambda x: int(x) if x.isdigit() else x)[index]
+                image_name = list(tool.images.keys())[index]
                 orig, mask, selected = tool.update_image(image_name)
                 # 获取当前可用的mask选项，保持mask选择
                 available_masks = get_available_mask_choices(tool)
