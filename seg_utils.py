@@ -177,7 +177,7 @@ def conv2d_matrix(gaussians, viewpoint_camera, indices_mask, device):
 
     return conv2d_matrix
 
-
+# 原位操作，不增加点云数量
 def update(gaussians, view, selected_index, ratios, dir_vector):
     ratios = ratios.unsqueeze(-1).to("cuda")
     selected_xyz = gaussians.get_xyz[selected_index]

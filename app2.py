@@ -1,18 +1,14 @@
-import gradio as gr
-from typing import List, Tuple, Dict
-
 import os
 import sys
 import cv2
-import time
 import torch
 
 import numpy as np
+import gradio as gr
 import torch.nn.functional as F
 import torchvision.transforms.functional as func
 
 from tqdm import tqdm
-from typing import Literal
 from plyfile import PlyData, PlyElement
 from argparse import ArgumentParser, Namespace
 
@@ -23,12 +19,9 @@ from gaussiansplatting.arguments import ModelParams, PipelineParams
 
 from seg_utils import grounding_dino_prompt
 from seg_utils import conv2d_matrix, compute_ratios, update
-from segment_anything import (SamAutomaticMaskGenerator, SamPredictor,
-                              sam_model_registry)
+from segment_anything import (SamAutomaticMaskGenerator, SamPredictor, sam_model_registry)
 from gradio_litmodel3d import LitModel3D
-from torch.profiler import profile, record_function, ProfilerActivity
 
-from time import time
 import datetime
 
 # 获取当前时间字符串的lambda函数
@@ -255,6 +248,9 @@ def mask_inverse(xyz, viewpoint_camera, sam_mask):
 # region 分割
 
 ## Gaussian Decomposition
+# 高斯边缘切割，原位操作，不增加点云数量
+# 做完之后，处于物体边缘的点会被修改
+# 可以作为分割后的后处理进行
 def gaussian_decomp(gaussians, viewpoint_camera, input_mask, indices_mask):
     xyz = gaussians.get_xyz
     point_image = project_to_2d(viewpoint_camera, xyz)
@@ -302,10 +298,15 @@ class GradioAnnotationTool:
             self.sam_features  = {}
             self.current_image =  None
 
-        self.saved_fg_path = None
-        self.saved_bg_path = None
+        self.has_ckpt = False
+        self.saved_curr_gs_path = None
+        self.saved_last_gs_path = None
+        self.saved_last_ckpt_gs_path = None
+        self.saved_curr_ckpt_gs_path = None
+        self.result_gaussian = None
 
         self.maskid = 0
+        self.segmode = 0 # Single, Multi
         self.clear_all_mark()
 
     def load_gaussian_scene(self, model_path, progress:gr.Progress=None):
@@ -352,9 +353,45 @@ class GradioAnnotationTool:
         self.sam_features = extract_sam_features_pt(model_path, self.predictor, self.scene.getTrainCameras(), self.scene.gaussians)
         self.current_image = list(self.images.keys())[0]
         self.predictor.set_image(self.images[self.current_image])
+
+        self.result_gaussian  = self.load_scene_gaussians()
+
+        # self.scene.gaussian:           场景的gaussian，每次分割都从此开始，不从中间的分割结果再次分割。
+        # self.last_gaussian:            合并后的分割结果，是从curr_gaussian一个个累加的
+        # self.saved_curr_gs_path:       保存的当前分割结果的路径 (用于展示)
+        # self.saved_last_gs_path:       保存的合并分割结果的路径 (用于展示)
+        # self.saved_curr_ckpt_gs_path:  暂存checkpoint路径       (用于恢复)
+        # self.saved_last_ckpt_gs_path:  暂存checkpoint路径       (用于恢复)
+        # self.用户用object名字保存的结果，直接存硬盘，展示路径用self.saved_last_gs_path
+
+        self.last_gaussian = None
+        self.saved_curr_gs_path = os.path.join(model_path, f'objects/tmp/tmp_curr.ply')
+        self.saved_last_gs_path = os.path.join(model_path, f'objects/tmp/tmp_last.ply')
+        self.saved_curr_ckpt_gs_path = os.path.join(model_path, f'objects/tmp/tmp_curr_ckpt.ply')
+        self.saved_last_ckpt_gs_path = os.path.join(model_path, f'objects/tmp/tmp_last_ckpt.ply')
+        os.makedirs(os.path.join(model_path, f'objects/tmp'), exist_ok=True)
+        os.system(f"rm -r {self.saved_curr_gs_path      }")
+        os.system(f"rm -r {self.saved_curr_ckpt_gs_path }")
+        os.system(f"rm -r {self.saved_last_gs_path      }")
+        os.system(f"rm -r {self.saved_last_ckpt_gs_path }")
+
         self.clear_all_mark()
-        print("加载完成")
         if progress is not None: progress(1, desc="Finished")
+        print("加载完成")
+
+    def load_gaussians(self, path):
+        gaussians = GaussianModel(self.dataset.sh_degree)
+        gaussians.load_ply(path)
+        return gaussians
+
+    def load_curr_gaussians(self):
+        if os.path.isfile(self.saved_curr_gs_path):
+            gaussians = GaussianModel(self.dataset.sh_degree)
+            gaussians.load_ply(self.saved_curr_gs_path)
+            return gaussians
+        else:
+            print(f"Curr Gaussian Not Found at: {self.saved_curr_gs_path}")
+            return None
 
     def load_scene_gaussians(self):
         gaussians = GaussianModel(self.dataset.sh_degree)
@@ -413,6 +450,7 @@ class GradioAnnotationTool:
         # 如果场景存在，更新3D点标注
         if self.scene is not None and len(mark['points']): self._update_3d_prompts()
         return self._render_original(), self._render_mask(), self._render_selected_mask()
+            # {i:len(self.seg2d_mark[i]["points"]) for i in self.seg2d_mark.keys()}
 
     def redo(self):
         """重做当前图片的操作"""
@@ -437,6 +475,12 @@ class GradioAnnotationTool:
         """设置当前选择的mask索引"""
         self.maskid = mask_id
         return self._render_selected_mask()
+    
+    def set_mode_id(self, mask_id):
+        """设置当前选择的mask索引"""
+        self.segmode = mask_id
+        self._get_mask()
+        return self._render_original(), self._render_mask(), self._render_selected_mask()
     
     def clear_current(self):
         """清空当前图片的所有标注"""
@@ -466,6 +510,9 @@ class GradioAnnotationTool:
             },
             "sam_all": {}                 # {img1_name: mask1, ...}（用于可视化）
         }
+        if self.has_ckpt is False:
+            self.ckpt_seg2d_mark = { name: {'points': [],'history': [],'history_index': -1,'prompts_3D': empty_3D.clone()} for name in self.images.keys()}
+            self.ckpt_record = {"prompts": None, "mvmask": {},"sam_all": {}}
         self._new_loaded = True
 
     def clear_all(self):
@@ -524,7 +571,6 @@ class GradioAnnotationTool:
             return return_mask / 255
         
         scene = self.scene
-        images = self.images
         mask_id = self.maskid
         cameras = scene.getTrainCameras()
         gaussians = scene.gaussians
@@ -542,41 +588,27 @@ class GradioAnnotationTool:
             multiview_masks.append(point_mask.unsqueeze(-1))
         return sam_mask_all_levels, sam_masks, multiview_masks
 
-        scene = self.scene
-        images = self.images
-        mask_id = self.maskid
-        cameras = scene.getTrainCameras()
-        gaussians = scene.gaussians
-        sam_masks = []
-        multiview_masks = []
-        sam_mask_all_levels = []
-
-        for i, view in tqdm(enumerate(cameras), desc="generate multiview masks"):
-            image_name = view.image_name # added
-            if text_prompt is not None:
-                render_image = images[image_name] # added
-                render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
-                sam_mask_all_level = text_prompt_seg(render_image, text_prompt)
-            else:
-                prompts_2d = project_to_2d(view, prompts_3D)
-                sam_mask_all_level = self_prompt_seg(prompts_2d, self.sam_features[image_name]) # [id,H,W,C=1]
-
-            sam_mask_all_levels.append(sam_mask_all_level)
-
-            sam_mask = sam_mask_all_level[mask_id]
-            if len(sam_mask.shape) != 2: sam_mask = torch.from_numpy(sam_mask).squeeze(-1).to("cuda")
-            else: sam_mask = torch.from_numpy(sam_mask).to("cuda")
-            sam_mask = sam_mask.long() # 2D mask image [H,W] -> value
-            sam_masks.append(sam_mask)
-            
-            point_mask, indices_mask = mask_inverse(gaussians.get_xyz, view, sam_mask)
-            multiview_masks.append(point_mask.unsqueeze(-1))
-        return sam_mask_all_levels, sam_masks, multiview_masks
-
     def _get_multilayer_mask(self, img_name):
         if self._new_loaded: return None
         return self.record["sam_all"].get(img_name)
 
+    def _get_single_view_seg(self, progress:gr.Progress=None):
+        prompts_3D = self.seg2d_mark[img_name]['prompts_3D']  # torch.Tensor[N,3], 单视角
+        tmp_sam_masks  = self.record["sam_all"].get(img_name)[self.maskid]['sam_masks'].clone()
+        tmp_multiviews = self.record["sam_all"].get(img_name)[self.maskid]['multiview'].clone()
+        sam_all, sam_masks, multiview_masks = self.generate_multiview_masks(prompts_3D)
+        self.record["sam_all"][img_name] = {"sam_masks": sam_masks, "multiview": multiview_masks}
+        self.saved_curr_gs_path = "tmp/saved_current_gs_single_view"
+        self.seg_gaussian(threshold=0.7, object_name=self.saved_curr_gs_path, progress=progress)
+        self.record["sam_all"][img_name] = {"sam_masks": tmp_sam_masks, "multiview": tmp_multiviews}
+        del sam_masks, multiview_masks
+        return self.saved_curr_gs_path
+
+    def _get_multi_view_seg(self, progress:gr.Progress=None):
+        self.saved_curr_gs_path = "tmp/saved_current_gs_multi_view"
+        self.seg_gaussian(threshold=0.7, object_name=self.saved_curr_gs_path, progress=progress)
+        return self.saved_curr_gs_path
+    
     def _get_mask(self, progress:gr.Progress=None):
         """
         根据prompts_3D和maskid作为索引，保存multiview_sam_masks, multiview_masks
@@ -588,14 +620,16 @@ class GradioAnnotationTool:
         multiview_sam_masks: 是选中的mask,用于3D分割,需要mask_id
         multiview_masks    : 是3D点的mask,用于3D分割,需要mask_id
         """
-        # 收集prompts_3D
-        prompts_3D_list = []
-        for img_name in self.images.keys():
-            prompts_3D = self.seg2d_mark[img_name]['prompts_3D']  # torch.Tensor[N,3]
-            if prompts_3D.shape[0] > 0: prompts_3D_list.append(prompts_3D)  # 检查是否有3D点标注
-        
-        if prompts_3D_list: prompts_3D_tensor = torch.cat(prompts_3D_list, dim=0)  # [M,3]
-        else: prompts_3D_tensor = torch.empty((0, 3), dtype=torch.float32, device="cuda")
+        if self.segmode == 0:   # Single
+            img_name = self.current_image
+            prompts_3D_tensor = self.seg2d_mark[img_name]['prompts_3D']  # torch.Tensor[N,3], 单视角
+        elif self.segmode == 1: # Multi
+            prompts_3D_list = []
+            for img_name in self.images.keys():
+                prompts_3D = self.seg2d_mark[img_name]['prompts_3D']  # torch.Tensor[N,3]
+                if prompts_3D.shape[0] > 0: prompts_3D_list.append(prompts_3D)  # 检查是否有3D点标注
+            if prompts_3D_list: prompts_3D_tensor = torch.cat(prompts_3D_list, dim=0)  # [M,3]
+            else: prompts_3D_tensor = torch.empty((0, 3), dtype=torch.float32, device="cuda")
 
         if progress is not None: progress(0, desc="prepare Prompt 3D")
         sam_alls, sam_masks, multiviews = self.generate_multiview_masks(prompts_3D_tensor, progress=progress)
@@ -716,104 +750,190 @@ class GradioAnnotationTool:
 
         return vote_labels, indices_mask
 
-    def seg_gaussian(self, threshold, object_name, progress:gr.Progress = None):
-        if progress is not None: progress(0, desc="load gaussians and mask")
-        self._get_mask(progress=progress) # 需要match maskid
-        model_path = self.scene.model_path
-        gaussians = self.scene.gaussians
-        _, final_mask = self.ensemble(threshold)
+    # 每次做2D->3D分割，都是从一个新的gaussians开始，分割到curr_gaussian里，保存到saved_curr_gs_path里
+    # add_to_result时，把last_gaussian保存到saved_last_gs_path里
+    # 用户主动保存时，把last_gaussian保存到object_name里
+    # seg_gaussian只处理curr_gaussian
+    def seg_gaussian(self, threshold, progress:gr.Progress = None):
+
+        if progress is not None: progress(0, desc="Seg3D - Loading Gaussian")
         cameras = self.scene.getTrainCameras()
-        if progress is not None: progress(0.1, desc="gaussian multiview decomp")
+        curr_gaussian = self.load_scene_gaussians()
 
-        self.saved_fg_path = os.path.join(model_path, f'objects/{object_name}/fg.ply')
-        os.makedirs(os.path.dirname(self.saved_fg_path), exist_ok=True)
-        save_gs(gaussians, final_mask, self.saved_fg_path)
-        if progress is not None: progress(0.3, desc="gaussian multiview decomp")
+        if progress is not None: progress(0.2, desc="Seg3D - Get Mask")
+        self._get_mask(progress=progress) # 需要match maskid
+        _, final_mask = self.ensemble(threshold)
 
-        # if gaussian decomposition as a post-process module
-        de_gaussian = self.load_scene_gaussians()
-        for i, view in tqdm(enumerate(cameras), desc="gaussian multiview decomp"):
+        if progress is not None: progress(0.4, desc="Seg3D - Decomposition")
+        for i, view in tqdm(enumerate(cameras)):
             if self.args.gd_interval != -1 and i % self.args.gd_interval == 0:
                 input_mask = self.record["mvmask"][self.maskid]["sam_masks"][i]
-                de_gaussian = gaussian_decomp(de_gaussian, view, input_mask, final_mask.to('cuda'))
-        if progress is not None: progress(0.5, desc="render segged gaussian")
+                curr_gaussian = gaussian_decomp(curr_gaussian, view, input_mask, final_mask.to('cuda'))
 
-        # save after gaussian decomposition
-        self.saved_bg_path = os.path.join(model_path, f'objects/{object_name}/bg.ply')
-        save_gs(de_gaussian, final_mask, self.saved_fg_path+"2.ply")
-        if progress is not None: progress(0.7, desc="render segged gaussian")
-        
-        # render object images
-        seg_gaussians = GaussianModel(self.dataset.sh_degree)
-        seg_gaussians.load_ply(self.saved_fg_path)
-        if progress is not None: progress(0.8, desc="render segged gaussian")
+        if progress is not None: progress(0.6, desc="Seg3D - Segment")
+        save_gs(curr_gaussian, final_mask, self.saved_curr_gs_path)
 
-        obj_save_path = os.path.join(model_path, f'objects/{object_name}/images')
-        os.makedirs(obj_save_path, exist_ok=True)
+        return self.saved_curr_gs_path
 
-        if not os.path.exists(obj_save_path): os.mkdir(obj_save_path)
-        for idx in tqdm(range(len(cameras)), desc="render segged gaussian"):
-            image_name = cameras[idx].image_name
-            view = cameras[idx]
+    def add_to_result(self):
+        if self.last_gaussian is None: # 第一次，直接复制给结果
+            self.last_gaussian = self.load_curr_gaussians()
+            if self.last_gaussian is not None: # None即无文件
+                os.system(f"cp {self.saved_curr_gs_path} {self.saved_last_gs_path}")
+        else: # 非第一次，叠加到结果
+            curr_gaussian = self.load_curr_gaussians()
+            if curr_gaussian is not None: # None即无文件
+                self.last_gaussian = self.last_gaussian + curr_gaussian
+                self.last_gaussian.save_ply(self.saved_last_gs_path)
+        return self.saved_last_gs_path
 
-            render_pkg = render(view, seg_gaussians, pipeline, background)
-            render_image = render_pkg["render"].permute(1, 2, 0).detach().cpu().numpy()
-            render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
-            render_image = cv2.cvtColor(render_image, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(os.path.join(obj_save_path, '{}.jpg'.format(image_name)), render_image)
-        seg_gaussians.save_ply(os.path.join(model_path, f'objects/{object_name}/seg.ply'))
-        if progress is not None: progress(1, desc="Finished")
+    def save_object(self, object_name):
+        if self.last_gaussian is not None:
+            path = os.path.join(self.scene.model_path, f'objects/{object_name}/fg.ply')
+            self.last_gaussian.save_ply(path)
+            return path
+        else:
+            print("self.last_gaussian is None.")
+            return None
 
+    # 标注情况暂存在变量里，Gaussian存为文件
+    def save_ckpt(self, progress:gr.Progress = None):
+        if progress is not None: progress(0, desc="Save Annotation")
+        self.has_ckpt = True
+        self.ckpt_seg2d_mask = {}
+        for key, value in self.seg2d_mark.items():
+            self.ckpt_seg2d_mask[key] = {
+                'points': value['points'][:],
+                'history': [(points[:], prompts_3D.clone() if prompts_3D is not None else None) 
+                           for points, prompts_3D in value['history']],
+                'history_index': value['history_index'],
+                'prompts_3D': value['prompts_3D'].clone() if value['prompts_3D'] is not None else empty_3D.clone()
+            }
+        self.ckpt_record = {
+            "prompts": self.record["prompts"].clone() if self.record["prompts"] is not None else None,
+            "mvmask": {
+                mask_id: {
+                    "multiview": [mask.clone() for mask in masks["multiview"]],
+                    "sam_masks": [mask.clone() for mask in masks["sam_masks"]]
+                }
+                for mask_id, masks in self.record["mvmask"].items()
+            },
+            "sam_all": {
+                img_name: mask.clone() if mask is not None else None
+                for img_name, mask in self.record["sam_all"].items()
+            }
+        }
+        if progress is not None: progress(0.3, desc="Save Current Gaussian")
+        if os.path.isfile(self.saved_curr_gs_path): os.system(f"cp {self.saved_curr_gs_path} {self.saved_curr_ckpt_gs_path}")
+        else: os.system(f"rm -f {self.saved_curr_ckpt_gs_path}")
+        if progress is not None: progress(0.7, desc="Save Result Gaussian")
+        if os.path.isfile(self.saved_last_gs_path): os.system(f"cp {self.saved_last_gs_path} {self.saved_last_ckpt_gs_path}")
+        else: os.system(f"rm -f {self.saved_last_ckpt_gs_path}")
+        if progress is not None: progress(1  , desc="Finished")
+        print("Checkpoint Saved")
 
+    # 标注情况暂存在变量里，Gaussian存为文件
+    def load_ckpt(self, progress:gr.Progress = None):
+        if progress is not None: progress(0, desc="Load Annotation")
+        if self.has_ckpt:
+            self.seg2d_mask = self.ckpt_seg2d_mask
+            self.record = self.ckpt_record
+            if progress is not None: progress(0, desc="Load Current Gaussian")
+            if os.path.isfile(self.saved_curr_ckpt_gs_path):
+                os.system(f"cp {self.saved_curr_ckpt_gs_path} {self.saved_curr_gs_path}")
+            if progress is not None: progress(0, desc="Load Result Gaussian")
+            if os.path.isfile(self.saved_last_ckpt_gs_path):
+                self.last_gaussian = self.load_gaussians(self.saved_last_ckpt_gs_path)
+                os.system(f"cp {self.saved_last_ckpt_gs_path} {self.saved_last_gs_path}")
+            if progress is not None: progress(0, desc="Checkpoint Loaded")
+        else:
+            if progress is not None: progress(1, desc="No Checkpoint")
+            print("No Checkpoint")
+        return self.saved_curr_gs_path, self.saved_last_gs_path
 
 def create_gradio_interface(default_model_paths, predictor):
     tool = GradioAnnotationTool(model_path=None, predictor=predictor)
     
-    with gr.Blocks() as demo:
+    with gr.Blocks(
+        css="""
+            .no-padding-border {
+                padding: 0 !important;
+                height: 40px !important;
+            }
+            #model-path-dropdown {
+                margin: 0 !important;
+            }
+            #object-name-input {
+                margin: 0 !important;
+                height: 38px !important;
+                padding: 4px !important;
+            }
+        """
+    ) as demo:
         with gr.Row():
-            original_display = gr.Image(label="Origin", interactive=False)
-            mask_display = gr.Image(label="Layer Mask", interactive=False)
+            original_display      = gr.Image(label="Origin", interactive=False)
+            mask_display          = gr.Image(label="Layer Mask", interactive=False)
             selected_mask_display = gr.Image(label="Mask Result", interactive=False)
         with gr.Row():
             with gr.Column(scale=1):
                 with gr.Row():
-                    undo_btn = gr.Button("Undo")
-                    redo_btn = gr.Button("Redo")
+                    undo_btn = gr.Button("撤销标注")
+                    redo_btn = gr.Button("重做标注")
                 with gr.Row():
-                    seg_view = gr.Button("Seg View")
-                    add_view = gr.Button("Add to Result")
+                    seg_curr = gr.Button("分割为3D")
+                    add_curr = gr.Button("加入最终结果")
 
             with gr.Column(scale=1):
                 with gr.Row():
-                    cls_cur_btn = gr.Button("Clear Curr View Marks")
-                    cls_all_btn = gr.Button("Clear All Views Marks")
+                    cls_cur_btn = gr.Button("清空当前视角标注")
+                    cls_all_btn = gr.Button("清空所有视角标注")
                 with gr.Row():
-                    seg_view = gr.Button("Save Checkpoint")
-                    seg_view = gr.Button("Clear Result")
+                    ckp_save = gr.Button("保存暂存点")
+                    ckp_rest = gr.Button("恢复暂存点")
 
             with gr.Column(scale=1):
                 with gr.Row():
                     mask_selector = gr.Radio(
                         choices=["S", "M", "L"], 
-                        label="Select Mask", 
+                        label="SAM Mask Layer", 
                         value="S",
                         interactive=True
                     )
+                    mode_selector = gr.Radio(
+                        choices=["Single", "Multi"], 
+                        label="Annotation Mode", 
+                        value="Single",
+                        interactive=True
+                    )
 
-        with gr.Row() as prompt_col:
-            with gr.Column(scale=1.5):
+        with gr.Row():
+            with gr.Column(scale=3):
                 model_path_input = gr.Dropdown(
                     choices=default_model_paths,
                     allow_custom_value=True,
                     value="",
                     show_label=False,
                     interactive=True,
+                    scale=1,
+                    min_width=40,
+                    container=False,
+                    elem_classes="no-padding-border",
+                    elem_id="model-path-dropdown"
                 )
-            with gr.Column(scale=0.5):
-                model_path_btn = gr.Button("Open Model")
             with gr.Column(scale=1):
-                object_name_input = gr.Textbox(placeholder="Your Object Name", show_label=False, interactive=True, submit_btn="Seg!")
-
+                model_path_btn = gr.Button("打开3D模型")
+            with gr.Column(scale=2):
+                object_name_input = gr.Textbox(
+                    placeholder="Your Object Name", 
+                    show_label=False, 
+                    interactive=True, 
+                    submit_btn="Save to Object File",
+                    scale=1,
+                    min_width=38,
+                    # container=False,
+                    # elem_classes="no-padding",
+                    elem_id="object-name-input"  # 添加唯一ID以便样式定位
+                )
         with gr.Row():
             with gr.Column(scale=2):
                 gallery = gr.Gallery(
@@ -825,11 +945,11 @@ def create_gradio_interface(default_model_paths, predictor):
                     allow_preview=False,
                 )
             with gr.Column(scale=1):
-                with gr.Row(): fg_gs = LitModel3D(label="Current View Segment", exposure=10.0, height=300)
-                with gr.Row(): download_fg_gs = gr.DownloadButton(label="Download", interactive=False)
+                with gr.Row(): curr_gs = LitModel3D(label="临时结果", exposure=10.0, height=300)
+                with gr.Row(): download_curr_gs = gr.DownloadButton(label="下载", interactive=False)
             with gr.Column(scale=1):
-                with gr.Row(): bg_gs = LitModel3D(label="Final Segment", exposure=10.0, height=300)
-                with gr.Row(): download_bg_gs = gr.DownloadButton(label="Download", interactive=False)
+                with gr.Row(): last_gs = LitModel3D(label="最终结果", exposure=10.0, height=300)
+                with gr.Row(): download_last_gs = gr.DownloadButton(label="下载", interactive=False)
         
         def on_mask_select(choice):
             if choice == "S": mask_id = 0
@@ -837,7 +957,13 @@ def create_gradio_interface(default_model_paths, predictor):
             elif choice == "L": mask_id = 2
             selected_mask = tool.set_mask_id(mask_id)
             return selected_mask
-        
+
+        def on_mode_select(choice):
+            if choice == "Single": mask_id = 0
+            elif choice == "Multi": mask_id = 1
+            original, mask, selected_mask = tool.set_mode_id(mask_id)
+            return original, mask, selected_mask
+
         def get_available_mask_choices(tool):
             # mark = tool.seg2d_mark[tool.current_image]
             # if tool._get_multilayer_mask() is None: return ["S"]
@@ -850,14 +976,14 @@ def create_gradio_interface(default_model_paths, predictor):
             available_masks = get_available_mask_choices(tool)
             mask_id = tool.maskid
             if mask_id >= len(available_masks): mask_id = len(available_masks)-1
-            return orig, mask, selected, gr.update(choices=available_masks, value=available_masks[mask_id] if available_masks else None)
+            return orig, mask, selected
 
         def add_point_from_mask(evt: gr.SelectData):
             orig, mask, selected = tool.add_point(evt, is_original=False)
             available_masks = get_available_mask_choices(tool)
             mask_id = tool.maskid
             if mask_id >= len(available_masks): mask_id = len(available_masks)-1
-            return orig, mask, selected, gr.update(choices=available_masks, value=available_masks[mask_id] if available_masks else None)
+            return orig, mask, selected
 
         def load_with_progress(model_path, progress=gr.Progress(track_tqdm=True)):
             torch.cuda.empty_cache()
@@ -868,51 +994,88 @@ def create_gradio_interface(default_model_paths, predictor):
             available_masks = get_available_mask_choices(tool)
             return \
                 gr.update(value = [(tool.images[k],k) for k in sorted(tool.images.keys(), key=lambda x: int(x) if x.isdigit() else x)]),\
-                orig, mask, selected, \
-                gr.update(choices=available_masks, value=available_masks[0] if available_masks else None)
+                orig, mask, selected
 
+        def save_ckpt(progress=gr.Progress(track_tqdm=True)):
+            tool.save_ckpt(progress)
+            return gr.update(interactive=True), gr.update(interactive=True)
+
+        def load_ckpt(progress=gr.Progress(track_tqdm=True)):
+            path1, path2 = tool.load_ckpt(progress)
+            orig, mask, selected = tool._render_original(), tool._render_mask(), tool._render_selected_mask()
+            return orig, mask, selected, path1, path1, path2, path2
+
+        def get_curr_seg(progress=gr.Progress(track_tqdm=True)):
+            path = tool.seg_gaussian(0.7, progress=progress)
+            return path, gr.update(value=path, interactive=True)
+
+        def add_curr_seg():
+            path = tool.add_to_result()
+            return path, gr.update(value=path, interactive=True)
+
+        # 加载模型
         model_path_btn.click(
             fn=load_with_progress,
             inputs=model_path_input,
-            outputs=[gallery, original_display, mask_display, selected_mask_display, mask_selector],
+            outputs=[gallery, original_display, mask_display, selected_mask_display],
         )
 
+        # 标点
         original_display.select(
             fn=add_point_from_original,
-            outputs=[original_display, mask_display, selected_mask_display, mask_selector]
+            outputs=[original_display, mask_display, selected_mask_display]
         )
         
         mask_display.select(
             fn=add_point_from_mask,
-            outputs=[original_display, mask_display, selected_mask_display, mask_selector]
+            outputs=[original_display, mask_display, selected_mask_display]
         )
         
+        # 选择模式
         mask_selector.change(
             fn=on_mask_select,
             inputs=[mask_selector],
             outputs=[selected_mask_display]
         )
-        
+
+        mode_selector.change(
+            fn=on_mode_select,
+            inputs=[mask_selector],
+            outputs=[original_display, mask_display, selected_mask_display, selected_mask_display]
+        )
+
+        # 操作
         undo_btn.click(fn=lambda: tool.undo(),   outputs=[original_display, mask_display, selected_mask_display])
         redo_btn.click(fn=lambda: tool.redo(),   outputs=[original_display, mask_display, selected_mask_display])
         cls_cur_btn.click(fn=tool.clear_current, outputs=[original_display, mask_display, selected_mask_display])
         cls_all_btn.click(fn=tool.clear_all,     outputs=[original_display, mask_display, selected_mask_display])
 
+        seg_curr.click(fn=get_curr_seg, outputs=[curr_gs, download_curr_gs])
+        add_curr.click(fn=add_curr_seg, outputs=[last_gs, download_last_gs])
+
+        ckp_save.click(fn=save_ckpt, outputs=[ckp_save, ckp_rest])
+        ckp_rest.click(fn=load_ckpt, outputs=[
+            original_display, mask_display, selected_mask_display,
+            curr_gs, download_curr_gs, last_gs, download_last_gs
+        ])
+
+        def save_gaussian(object_name):
+            tool.save_object(object_name)
+
         def seg_gaussian_with_prompt(object_name, progress=gr.Progress(track_tqdm=True)):
             yield gr.update(value=f"Processing: '{object_name}'...", interactive=False)
-            tool.seg_gaussian(threshold=0.7, object_name=object_name, progress=None)
+            tool.seg_gaussian(threshold=0.7, object_name=object_name, progress=progress)
             yield gr.update(value=object_name, placeholder="Your Object Name", interactive=True)
 
         object_name_input.submit( # 保存Gaussian
-            fn=seg_gaussian_with_prompt,
+            fn=save_gaussian,
             inputs=object_name_input,
-            outputs=[object_name_input]
         ).then( # 显示Gaussian
-            fn=lambda: tool.saved_fg_path,
-            outputs=[fg_gs]
-        ).then(
-            fn = lambda: gr.update(value=tool.saved_fg_path, interactive=True),
-            outputs=[download_fg_gs],
+            fn=lambda: (tool.saved_curr_gs_path, gr.update(value=tool.saved_curr_gs_path, interactive=True)),
+            outputs=[curr_gs, download_curr_gs]
+        ).then( # 显示Gaussian
+            fn=lambda: (tool.saved_last_gs_path, gr.update(value=tool.saved_last_gs_path, interactive=True)),
+            outputs=[last_gs, download_last_gs]
         )
         
         # Gallery选择事件处理
@@ -965,14 +1128,11 @@ def find_model_folders(base_path, relative_to="."):
 
 if __name__ == "__main__":
 
-    # with profile(on_trace_ready=torch.profiler.tensorboard_trace_handler('./log')) as prof:
-        base_dir = "../TRELLIS/results"
-        default_model_paths = find_model_folders(base_dir)
+    base_dir = "../TRELLIS/results"
+    default_model_paths = find_model_folders(base_dir)
 
-        predictor = load_sam()
+    predictor = load_sam()
 
-        # 创建并启动Gradio界面，传入预先提取的特征和场景
-        demo = create_gradio_interface(default_model_paths, predictor)
-        demo.launch(server_name="0.0.0.0", server_port=None,
-            allowed_paths = ["./", base_dir])
-
+    demo = create_gradio_interface(default_model_paths, predictor)
+    demo.launch(server_name="0.0.0.0", server_port=None,
+        allowed_paths = ["./", base_dir])

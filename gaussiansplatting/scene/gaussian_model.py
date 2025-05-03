@@ -58,6 +58,138 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
 
+    def __add__(self, other, threshold = 1e-5):
+        """将两个GaussianModel点云模型相加"""
+        if other is None: return self
+        assert self.max_sh_degree == other.max_sh_degree, f"max_sh_degree {self.max_sh_degree} != {other.max_sh_degree}"
+        result = GaussianModel(self.max_sh_degree)
+        
+        # 合并
+        result._xyz           = torch.cat([self._xyz          .detach(), other._xyz          .detach()], dim=0)
+        result._features_dc   = torch.cat([self._features_dc  .detach(), other._features_dc  .detach()], dim=0)
+        result._features_rest = torch.cat([self._features_rest.detach(), other._features_rest.detach()], dim=0)
+        result._opacity       = torch.cat([self._opacity      .detach(), other._opacity      .detach()], dim=0)
+        result._scaling       = torch.cat([self._scaling      .detach(), other._scaling      .detach()], dim=0)
+        result._rotation      = torch.cat([self._rotation     .detach(), other._rotation     .detach()], dim=0)
+        
+        result.max_radii2D        = torch.zeros((result.get_xyz.shape[0])   , device="cuda")
+        result.xyz_gradient_accum = torch.zeros((result.get_xyz.shape[0], 1), device="cuda")
+        result.denom              = torch.zeros((result.get_xyz.shape[0], 1), device="cuda")
+        
+        result.active_sh_degree = max(self.active_sh_degree, other.active_sh_degree)
+        result.spatial_lr_scale = max(self.spatial_lr_scale, other.spatial_lr_scale)
+        result.percent_dense    = max(self.percent_dense, other.percent_dense)
+        
+        if threshold is not None:
+            # 对合并后的点，计算重复点并删除。默认删除索引更大的点（other来源的点）
+            sorted_indices = torch.argsort(result._xyz[:, 0])  # 按x坐标排序
+            sorted_xyz = result._xyz[sorted_indices]
+
+            # 计算相邻点的距离
+            diff_sorted = sorted_xyz[1:] - sorted_xyz[:-1]
+            dist_sorted = torch.norm(diff_sorted, dim=1)
+            
+            # 创建掩码并映射回原始索引
+            valid_mask = torch.ones(result._xyz.shape[0], dtype=torch.bool, device=result._xyz.device)
+            valid_mask[sorted_indices[1:]] = dist_sorted > threshold
+            
+            # 应用掩码到result的所有属性
+            result.apply_mask(valid_mask)
+            
+            result.active_sh_degree = max(self.active_sh_degree, other.active_sh_degree)
+            result.spatial_lr_scale = max(self.spatial_lr_scale, other.spatial_lr_scale)
+            result.percent_dense    = max(self.percent_dense   , other.percent_dense)
+        
+        return result
+
+    def deepcopy(self):
+        """深度复制当前高斯模型,包括所有参数、梯度和优化器状态"""
+        new_model = GaussianModel(self.max_sh_degree)
+        
+        # 复制基本属性
+        new_model.active_sh_degree = self.active_sh_degree
+        new_model.spatial_lr_scale = self.spatial_lr_scale
+        new_model.percent_dense = self.percent_dense
+        
+        # 复制所有张量参数及其梯度
+        new_model._xyz = nn.Parameter(self._xyz.detach().clone())
+        new_model._features_dc = nn.Parameter(self._features_dc.detach().clone())
+        new_model._features_rest = nn.Parameter(self._features_rest.detach().clone())
+        new_model._scaling = nn.Parameter(self._scaling.detach().clone())
+        new_model._rotation = nn.Parameter(self._rotation.detach().clone())
+        new_model._opacity = nn.Parameter(self._opacity.detach().clone())
+        
+        if self._xyz.grad is not None:
+            new_model._xyz.grad = self._xyz.grad.clone()
+        if self._features_dc.grad is not None:
+            new_model._features_dc.grad = self._features_dc.grad.clone()
+        if self._features_rest.grad is not None:
+            new_model._features_rest.grad = self._features_rest.grad.clone()
+        if self._scaling.grad is not None:
+            new_model._scaling.grad = self._scaling.grad.clone()
+        if self._rotation.grad is not None:
+            new_model._rotation.grad = self._rotation.grad.clone()
+        if self._opacity.grad is not None:
+            new_model._opacity.grad = self._opacity.grad.clone()
+            
+        # 复制其他状态张量
+        new_model.max_radii2D = self.max_radii2D.clone() if self.max_radii2D is not None else None
+        new_model.xyz_gradient_accum = self.xyz_gradient_accum.clone() if self.xyz_gradient_accum is not None else None
+        new_model.denom = self.denom.clone() if self.denom is not None else None
+        
+        # 如果存在优化器,复制优化器状态
+        if self.optimizer is not None:
+            # 设置新模型的优化器参数组
+            l = [
+                {'params': [new_model._xyz], 'lr': self.optimizer.param_groups[0]['lr'], "name": "xyz"},
+                {'params': [new_model._features_dc], 'lr': self.optimizer.param_groups[1]['lr'], "name": "f_dc"},
+                {'params': [new_model._features_rest], 'lr': self.optimizer.param_groups[2]['lr'], "name": "f_rest"},
+                {'params': [new_model._opacity], 'lr': self.optimizer.param_groups[3]['lr'], "name": "opacity"},
+                {'params': [new_model._scaling], 'lr': self.optimizer.param_groups[4]['lr'], "name": "scaling"},
+                {'params': [new_model._rotation], 'lr': self.optimizer.param_groups[5]['lr'], "name": "rotation"}
+            ]
+            
+            new_model.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+            
+            # 复制优化器状态字典
+            optimizer_state = self.optimizer.state_dict()
+            new_model.optimizer.load_state_dict(optimizer_state)
+            
+            # 确保优化器状态指向新参数
+            for old_param, new_param in zip(self.optimizer.state.keys(), new_model.optimizer.state.keys()):
+                new_model.optimizer.state[new_param] = {
+                    key: value.clone() if torch.is_tensor(value) else value
+                    for key, value in self.optimizer.state[old_param].items()
+                }
+        
+        return new_model
+
+    def save_gs(pc, indices_mask, save_path):
+        xyz = pc._xyz.detach().cpu()[indices_mask].numpy()
+        normals = np.zeros_like(xyz)
+        f_dc = pc._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu()[indices_mask].numpy()
+        f_rest = pc._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu()[indices_mask].numpy()
+        opacities = pc._opacity.detach().cpu()[indices_mask].numpy()
+        scale = pc._scaling.detach().cpu()[indices_mask].numpy()
+        rotation = pc._rotation.detach().cpu()[indices_mask].numpy()
+        dtype_full = [(attribute, 'f4') for attribute in pc.construct_list_of_attributes()]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, 'vertex')
+        PlyData([el]).write(save_path)
+        
+    def apply_mask(self, indices_mask):
+        self._xyz                = nn.Parameter(self._xyz               [indices_mask].requires_grad_(False))
+        self._features_dc        = nn.Parameter(self._features_dc       [indices_mask].requires_grad_(False))
+        self._features_rest      = nn.Parameter(self._features_rest     [indices_mask].requires_grad_(False))
+        self._scaling            = nn.Parameter(self._scaling           [indices_mask].requires_grad_(False))
+        self._rotation           = nn.Parameter(self._rotation          [indices_mask].requires_grad_(False))
+        self._opacity            = nn.Parameter(self._opacity           [indices_mask].requires_grad_(False))
+        self.max_radii2D         = nn.Parameter(self.max_radii2D        [indices_mask].requires_grad_(False))
+        self.xyz_gradient_accum  = nn.Parameter(self.xyz_gradient_accum [indices_mask].requires_grad_(False))
+        self.denom               = nn.Parameter(self.denom              [indices_mask].requires_grad_(False))
+
     def capture(self):
         return (
             self.active_sh_degree,
@@ -246,12 +378,12 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._xyz           = nn.Parameter(torch.tensor(xyz            , dtype=torch.float, device="cuda")                             .requires_grad_(False))
+        self._features_dc   = nn.Parameter(torch.tensor(features_dc    , dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(False))
+        self._features_rest = nn.Parameter(torch.tensor(features_extra , dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(False))
+        self._opacity       = nn.Parameter(torch.tensor(opacities      , dtype=torch.float, device="cuda")                             .requires_grad_(False))
+        self._scaling       = nn.Parameter(torch.tensor(scales         , dtype=torch.float, device="cuda")                             .requires_grad_(False))
+        self._rotation      = nn.Parameter(torch.tensor(rots           , dtype=torch.float, device="cuda")                             .requires_grad_(False))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -292,12 +424,12 @@ class GaussianModel:
         valid_points_mask = ~mask
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
+        self._xyz           = optimizable_tensors["xyz"]
+        self._features_dc   = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
-        self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
+        self._opacity       = optimizable_tensors["opacity"]
+        self._scaling       = optimizable_tensors["scaling"]
+        self._rotation      = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 

@@ -3,14 +3,35 @@
 
 ## SAGS with a Gradio Interface
 
-#### 25.05.02
-No Cached Result of SAM. Now the GPU Memory Usage is stable.
+SAGS with a Gradio Interface.
+Multiview Annotation and Merge.
 
-#### 25.05.01
+Gradio版本的SAGS，支持多视角标注，支持多次标注并合并输出为一个Gaussian Splatting结果
+需要的文件目录：Gaussian训练的数据集文件夹和结果文件夹。结果文件夹中args文件保存了数据集文件夹的目录，因此只需要打开结果文件夹的目录即可。
+
+### 25.05.03 app2.py
+app2.py：修改用户流程，解决遮挡物体分割不佳的问题
+1. 使用单视角标注，得到单视角的GS结果
+2. 融合多个单视角GS的结果，加入最终的GS分割结果
+
+New Pipeline in app2.py: (to solve poor segmentation of occluded objects)
+1. Using single perspective annotation to obtain GS results from a single perspective
+2. Continuously merging new single perspective results into the final result
+
+compare to app.py:
+1. Directly using multi view annotation to obtain multi view masks
+2. Generate the final GS result directly using multi perspective annotation
+
+### 25.05.02
+No Cached Result of SAM. Now the GPU Memory Usage is stable.
+不使用计算结果的缓存了。使用缓存的版本是app_cached_result(deprecated).py
+
+### 25.05.01
 Speedup x10 (in multi view segment) by change some numpy operator to torch, see app.py
 every single click need 1800MB GPU Memory(with 90pic dataset). I will fix it.
+分割确实快了，还需要去除保存计算结果缓存的模块
 
-#### 25.04.30
+### 25.04.30
 Use it to segment any gaussian easily, capable with multiview annotation ability.
 Text prompt would be release when I'm available.
 Undo and Redo might incur additional GPU Memory cost.
@@ -18,11 +39,13 @@ Requires gradio==5
 
 Gradio版本的SAGS，支持多视角标注，背面也可以加约束了。
 发现背面加约束这个事情有点鸡肋，猜测是3D投票过程并不能很好支持复杂的遮挡关系
-计划：
-1. 改为进行多次单视角GS分割，将多个视角得到的GS结果直接组合得到最终结果
-2. 有空想整一个文本提示版本。
-
 每次的撤消和重做的结果都保存了，不会重复存，但是反复折腾可能会占点显存。
+
+计划：
+- ✅改为进行多次单视角GS分割，将多个视角得到的GS结果直接组合得到最终结果
+- ✅尝试加快分割，不使用计算结果的缓存，减少GPU内存占用
+- ⭕️有空想整一个文本提示版本
+
 
 
 ## Introduction

@@ -604,37 +604,6 @@ class GradioAnnotationTool:
             multiview_masks.append(point_mask.unsqueeze(-1))
         return sam_mask_all_levels, sam_masks, multiview_masks
 
-        scene = self.scene
-        images = self.images
-        mask_id = self.maskid
-        cameras = scene.getTrainCameras()
-        gaussians = scene.gaussians
-        sam_masks = []
-        multiview_masks = []
-        sam_mask_all_levels = []
-
-        for i, view in tqdm(enumerate(cameras), desc="generate multiview masks"):
-            image_name = view.image_name # added
-            if text_prompt is not None:
-                render_image = images[image_name] # added
-                render_image = (255 * np.clip(render_image, 0, 1)).astype(np.uint8)
-                sam_mask_all_level = text_prompt_seg(render_image, text_prompt)
-            else:
-                prompts_2d = project_to_2d(view, prompts_3D)
-                sam_mask_all_level = self_prompt_seg(prompts_2d, self.sam_features[image_name]) # [id,H,W,C=1]
-
-            sam_mask_all_levels.append(sam_mask_all_level)
-
-            sam_mask = sam_mask_all_level[mask_id]
-            if len(sam_mask.shape) != 2: sam_mask = torch.from_numpy(sam_mask).squeeze(-1).to("cuda")
-            else: sam_mask = torch.from_numpy(sam_mask).to("cuda")
-            sam_mask = sam_mask.long() # 2D mask image [H,W] -> value
-            sam_masks.append(sam_mask)
-            
-            point_mask, indices_mask = mask_inverse(gaussians.get_xyz, view, sam_mask)
-            multiview_masks.append(point_mask.unsqueeze(-1))
-        return sam_mask_all_levels, sam_masks, multiview_masks
-
     def _get_multilayer_mask(self, img_name):
         if self._new_loaded: return None
         return self.record["sam_all"].get(img_name)
@@ -1030,7 +999,6 @@ if __name__ == "__main__":
 
         predictor = load_sam()
 
-        # 创建并启动Gradio界面，传入预先提取的特征和场景
         demo = create_gradio_interface(default_model_paths, predictor)
         demo.launch(server_name="0.0.0.0", server_port=None,
             allowed_paths = ["./", base_dir])
